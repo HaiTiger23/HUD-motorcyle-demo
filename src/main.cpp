@@ -373,7 +373,11 @@ void loop() {
     handleSerialCommands();
     companionUiTick();
 #endif
+    const uint32_t frameStart = millis();
     lv_timer_handler();
+    // Measurement aid: a map JPEG decode or full-screen flush shows up here.
+    const uint32_t frameMs = millis() - frameStart;
+    if (frameMs >= 60) Serial.printf("LVGL slow frame: %ums\n", unsigned(frameMs));
     serviceDisplayTimeout();
     delay(5);
 }

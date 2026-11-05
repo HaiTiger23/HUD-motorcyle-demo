@@ -123,8 +123,13 @@ public enum HUDMapCadence {
     public static func refreshBase(age: TimeInterval, movement: Double, headingChange: Double) -> Bool {
         age >= 8 || (age >= 1.5 && (movement >= 18 || headingChange >= 12))
     }
-    public static func sendFrame(age: TimeInterval, movement: Double, changed: Bool) -> Bool {
-        age >= 1 && (changed || movement >= 1.5 || age >= 5)
+    /// Faster riders get a shorter minimum gap so the marker does not lag the
+    /// road; `speed` is m/s and defaults to 0 (the original 1 s cadence).
+    public static func minimumFrameGap(speed: Double) -> TimeInterval {
+        speed >= 8 ? 0.7 : 1
+    }
+    public static func sendFrame(age: TimeInterval, movement: Double, changed: Bool, speed: Double = 0) -> Bool {
+        age >= minimumFrameGap(speed: speed) && (changed || movement >= 1.5 || age >= 5)
     }
 }
 

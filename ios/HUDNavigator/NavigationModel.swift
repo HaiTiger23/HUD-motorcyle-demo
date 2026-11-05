@@ -79,6 +79,7 @@ import Combine
     private var lastPlan = Date.distantPast
     private var planning = false
     private var rendering = false
+    private var encoding = false
     private var directions: MKDirections?
     private var search: MKLocalSearch?
     private var snapshotter: MKMapSnapshotter?
@@ -638,19 +639,38 @@ import Combine
             requestSnapshot(location: latest, heading: heading, light: light)
         }
         // A pending tile fetch must not hold up the latest position/instruction.
-        guard !bluetooth.busy, let snapshot = cachedSnapshot, snapshotLight == light, snapshotEpoch == cameraEpoch,
+        guard !bluetooth.busy, !encoding, let snapshot = cachedSnapshot, snapshotLight == light, snapshotEpoch == cameraEpoch,
               sentCameraEpoch != snapshotEpoch || HUDMapCadence.sendFrame(age: now.timeIntervalSince(lastRender),
                 movement: sentLocation.map { latest.distance(from: $0) } ?? .infinity,
-                changed: sentBaseVersion != baseVersion || sentInstruction != instruction || sentMarker != renderedMarker) else { return }
-        let image = compose(snapshot: snapshot, location: latest, marker: renderedMarker)
-        var jpeg = image.jpegData(compressionQuality: 0.55)
-        if let size = jpeg?.count, size > 12 * 1024 { jpeg = image.jpegData(compressionQuality: 0.42) }
-        guard let jpeg, jpeg.count <= HUDWire.maxImage else { return }
-        preview = image
-        lastRender = now; sentLocation = latest; sentInstruction = instruction; sentBaseVersion = baseVersion
-        if let id = bluetooth.send(jpeg: jpeg, externalGuidance: externalGuidance) {
-            sentCameraEpoch = snapshotEpoch; sentMarker = renderedMarker
-            frameContexts.append(FrameContext(id: id, snapshot: snapshot, center: snapshotCenter, heading: snapshotHeading))
+                changed: sentBaseVersion != baseVersion || sentInstruction != instruction || sentMarker != renderedMarker,
+                speed: max(0, latest.speed)) else { return }
+        // Drawing and JPEG encoding take tens of milliseconds; run them off the
+        // main actor so the UI, GPS callbacks and BLE pump are never blocked.
+        let remaining = max(0, (steps.first { $0.end > progress + 3 }?.end ?? progress) - progress)
+        let job = MapRenderJob(snapshot: snapshot, location: latest, marker: renderedMarker, light: light,
+            heading: snapshotHeading, center: snapshotCenter, epoch: snapshotEpoch, baseVersion: baseVersion,
+            routePath: cachedRoutePath, instruction: instruction, remaining: remaining,
+            externalGuidance: externalGuidance, revision: revision, maxBytes: HUDWire.maxImage)
+        encoding = true
+        lastRender = now
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let started = Date()
+            let result = Self.renderFrame(job)
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            await self?.finishRender(job, result: result, renderMs: ms)
+        }
+    }
+    private func finishRender(_ job: MapRenderJob, result: (image: UIImage, jpeg: Data)?, renderMs: Int) {
+        encoding = false
+        // Drop frames made for a camera, route or session that has since changed.
+        guard let result, navigating, job.revision == revision, job.epoch == cameraEpoch,
+              job.epoch == snapshotEpoch, !bluetooth.busy else { return }
+        print("HUD map: renderMs=\(renderMs); jpegBytes=\(result.jpeg.count)")
+        preview = result.image
+        sentLocation = job.location; sentInstruction = job.instruction; sentBaseVersion = job.baseVersion
+        if let id = bluetooth.send(jpeg: result.jpeg, externalGuidance: job.externalGuidance) {
+            sentCameraEpoch = job.epoch; sentMarker = job.marker
+            frameContexts.append(FrameContext(id: id, snapshot: job.snapshot, center: job.center, heading: job.heading))
             if frameContexts.count > 6 { frameContexts.removeFirst(frameContexts.count - 6) }
         }
     }
@@ -735,10 +755,19 @@ import Combine
             }
         }
     }
-    private func compose(snapshot: MKMapSnapshotter.Snapshot, location: CLLocation, marker: HUDLocationMarker) -> UIImage {
+    nonisolated private static func renderFrame(_ job: MapRenderJob) -> (image: UIImage, jpeg: Data)? {
+        let image = compose(job)
+        var jpeg = image.jpegData(compressionQuality: 0.55)
+        if let size = jpeg?.count, size > 12 * 1024 { jpeg = image.jpegData(compressionQuality: 0.42) }
+        guard let jpeg, jpeg.count <= job.maxBytes else { return nil }
+        return (image, jpeg)
+    }
+    nonisolated private static func compose(_ job: MapRenderJob) -> UIImage {
+        let snapshot = job.snapshot, location = job.location, marker = job.marker
+        let instruction = job.instruction, externalGuidance = job.externalGuidance
         let instructionText = instruction
         let format = UIGraphicsImageRendererFormat(); format.scale = 1; format.opaque = true
-        let light = bluetooth.settings.theme >= 4
+        let light = job.light
         let mapInk: UIColor = light ? .systemBlue : .white
         let textInk: UIColor = light ? .black : .white
         return UIGraphicsImageRenderer(size: CGSize(width: HUDWire.imageWidth, height: HUDWire.imageHeight), format: format).image { renderer in
@@ -746,13 +775,13 @@ import Combine
             let context = renderer.cgContext
             context.saveGState(); context.clip(to: CGRect(x: 0, y: 0, width: 300, height: 180))
             context.setStrokeColor(mapInk.cgColor); context.setLineWidth(5); context.setLineCap(.round); context.setLineJoin(.round)
-            if let path = cachedRoutePath { context.addPath(path) }
+            if let path = job.routePath { context.addPath(path) }
             context.strokePath()
             let point = snapshot.point(for: location.coordinate)
             context.translateBy(x: point.x, y: point.y)
             context.setFillColor(mapInk.cgColor); context.setStrokeColor((light ? UIColor.white : UIColor.black).cgColor); context.setLineWidth(2)
             if marker == .arrow {
-                context.rotate(by: (location.course - snapshotHeading) * .pi / 180)
+                context.rotate(by: (location.course - job.heading) * .pi / 180)
                 context.move(to: CGPoint(x: 0, y: -11))
                 context.addLine(to: CGPoint(x: -8, y: 9))
                 context.addLine(to: CGPoint(x: 0, y: 5))
@@ -762,7 +791,7 @@ import Combine
             }
             context.restoreGState()
             if externalGuidance { return }
-            let remaining = max(0, (steps.first { $0.end > progress + 3 }?.end ?? progress) - progress)
+            let remaining = job.remaining
             let distance = remaining >= 1000 ? String(format: "%.1f km", remaining / 1000) : "\(Int(remaining.rounded())) m"
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byWordWrapping
@@ -804,4 +833,23 @@ private final class MapLinkRedirectGuard: NSObject, URLSessionTaskDelegate {
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(request.url.map { MapShare.allowed($0) } == true ? request : nil)
     }
+}
+
+/// Everything the off-main renderer needs, captured on the main actor.
+/// MKMapSnapshotter.Snapshot is immutable once delivered, so sharing it is safe.
+private struct MapRenderJob: @unchecked Sendable {
+    let snapshot: MKMapSnapshotter.Snapshot
+    let location: CLLocation
+    let marker: HUDLocationMarker
+    let light: Bool
+    let heading: Double
+    let center: CLLocationCoordinate2D
+    let epoch: Int
+    let baseVersion: Int
+    let routePath: CGPath?
+    let instruction: String
+    let remaining: Double
+    let externalGuidance: Bool
+    let revision: Int
+    let maxBytes: Int
 }

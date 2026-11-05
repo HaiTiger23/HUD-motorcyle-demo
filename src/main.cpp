@@ -1,8 +1,16 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <Wire.h>
 #include <lvgl.h>
 
+#include "board_config.h"
+#include "ai_voice.h"
+#include "companion_ui.h"
+#include "ili9341v_panel.h"
+#include "phone_link.h"
+#include "hud_settings.h"
 #include "ui.h"
+#include <display_geometry.h>
 
 namespace {
 constexpr uint16_t SCREEN_WIDTH = 320;
@@ -14,10 +22,106 @@ constexpr uint32_t BUTTON_PULSE_MS = 180;
 
 TFT_eSPI tft;
 lv_display_t* display;
-lv_color_t displayBuffer[SCREEN_WIDTH * LVGL_BUFFER_LINES];
+alignas(4) uint16_t displayBuffer[SCREEN_WIDTH * LVGL_BUFFER_LINES];
 uint32_t lastHudUpdate = 0;
 uint32_t buttonPressedUntil = 0;
 lv_obj_t* pressedButton = nullptr;
+lv_indev_t* touchInput = nullptr;
+uint32_t lastTouchAt = 0;
+bool screenAwake = true;
+bool swallowWakeTouch = false;
+bool lastTouchDown=false;
+uint8_t displayRotation=0;
+void setBacklight(bool awake) {
+    static int previous=-1;
+    const int duty=huddisplay::duty(hudHardwareSettingsGet().brightness,awake);
+    if(previous!=duty) { ledcWrite(2,duty); previous=duty; }
+}
+
+bool readTouch(uint16_t& x, uint16_t& y) {
+    // FT6336 register 0x02 contains the number of contacts.  The first point
+    // starts at 0x03: XH, XL, YH, YL.  This is the same controller and mapping
+    // used by the manufacturer's LVGL sample.
+    Wire.beginTransmission(board::TOUCH_I2C_ADDRESS);
+    Wire.write(0x02);
+    if (Wire.endTransmission(false) != 0 ||
+        Wire.requestFrom(board::TOUCH_I2C_ADDRESS, static_cast<uint8_t>(5)) != 5) {
+        return false;
+    }
+
+    const uint8_t contacts = Wire.read() & 0x0f;
+    const uint8_t xh = Wire.read();
+    const uint8_t xl = Wire.read();
+    const uint8_t yh = Wire.read();
+    const uint8_t yl = Wire.read();
+    if (contacts == 0 || contacts > 2) {
+        return false;
+    }
+
+    const uint16_t rawX = static_cast<uint16_t>((xh & 0x0f) << 8) | xl;
+    const uint16_t rawY = static_cast<uint16_t>((yh & 0x0f) << 8) | yl;
+
+    // TFT_eSPI rotation 1: rotate the native 240 x 320 touch coordinates
+    // clockwise into the 320 x 240 HUD coordinate system.
+    const auto point=huddisplay::touch(rawX,rawY,displayRotation);
+    x=point.x; y=point.y;
+    return true;
+}
+
+void readTouchInput(lv_indev_t*, lv_indev_data_t* data) {
+    static uint16_t x = 0;
+    static uint16_t y = 0;
+    const bool touching = readTouch(x, y);
+    lastTouchDown=touching;
+    const bool wasWakeTouch=swallowWakeTouch;
+    if (touching) {
+        lastTouchAt = millis();
+        if (!screenAwake) {
+            screenAwake = true;
+            setBacklight(true);
+            // The entire first contact only wakes the screen; it must not
+            // activate a music button or tab hidden beneath the finger.
+            swallowWakeTouch = true;
+            Serial.println("Display awake: touch");
+        }
+    } else {
+        swallowWakeTouch = false;
+    }
+    bool consumed=false;
+#ifndef HUD_DEMO_ONLY
+    consumed=companionUiTouch(touching,x,y,swallowWakeTouch || wasWakeTouch);
+#endif
+    data->state = touching && !swallowWakeTouch && !consumed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    data->point.x = x;
+    data->point.y = y;
+}
+
+void serviceDisplayTimeout() {
+    // Keep touch, LVGL and the BLE link running; only switch the backlight.
+    // If touch failed to initialize, leave the screen on so it remains usable.
+    const uint32_t timeout = hudSettingsGet().timeoutSeconds * 1000UL;
+#ifndef HUD_DEMO_ONLY
+    // A live navigation page must remain readable without touching it while riding.
+    if (companionUiNavigationActive() || aiVoiceBusy() || aiVoiceSpeakerBusy()) {
+        lastTouchAt = millis();
+        if (!screenAwake) {
+            screenAwake = true;
+            setBacklight(true);
+        }
+    }
+#endif
+    static uint32_t previousTimeout = timeout;
+    if (previousTimeout != timeout) {
+        previousTimeout = timeout;
+        lastTouchAt = millis(); screenAwake = true;
+        setBacklight(true);
+    }
+    if (touchInput && screenAwake && timeout && uint32_t(millis() - lastTouchAt) >= timeout) {
+        setBacklight(false);
+        screenAwake = false;
+        Serial.printf("Display asleep: %us without touch\n", unsigned(timeout / 1000));
+    }
+}
 
 void flushDisplay(lv_display_t* display, const lv_area_t* area, uint8_t* pixels) {
     const uint32_t width = static_cast<uint32_t>(area->x2 - area->x1 + 1);
@@ -31,12 +135,19 @@ void flushDisplay(lv_display_t* display, const lv_area_t* area, uint8_t* pixels)
 }
 
 void initDisplay() {
+    pinMode(board::LCD_BACKLIGHT, OUTPUT);
+    digitalWrite(board::LCD_BACKLIGHT,HIGH);
+
     tft.begin();
-    tft.setRotation(TFT_ROTATION);
+    initIli9341vPanel(tft);
+    displayRotation=hudHardwareSettingsGet().rotation;
+    tft.setRotation((TFT_ROTATION+displayRotation)%4);
     tft.fillScreen(TFT_BLACK);
+    ledcSetup(2,5000,8); ledcAttachPin(board::LCD_BACKLIGHT,2); setBacklight(true);
 
     lv_init();
-    display = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    display = lv_display_create(tft.width(), tft.height());
+    lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(
         display,
         displayBuffer,
@@ -44,6 +155,45 @@ void initDisplay() {
         sizeof(displayBuffer),
         LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display, flushDisplay);
+}
+void serviceHardwareSettings() {
+    const auto& hardware=hudHardwareSettingsGet();
+    setBacklight(screenAwake);
+    static int previousVolume=-1;
+    if(previousVolume!=hardware.speakerVolume && aiVoiceSetSpeakerVolume(hardware.speakerVolume)) previousVolume=hardware.speakerVolume;
+    if(displayRotation!=hardware.rotation && !lastTouchDown && !aiVoiceBusy()) {
+        displayRotation=hardware.rotation;
+        tft.setRotation((TFT_ROTATION+displayRotation)%4); tft.fillScreen(TFT_BLACK);
+        lv_display_set_resolution(display,tft.width(),tft.height());
+        lv_display_set_buffers(display,displayBuffer,nullptr,sizeof(displayBuffer),LV_DISPLAY_RENDER_MODE_PARTIAL);
+        if(touchInput) lv_indev_reset(touchInput,nullptr);
+        companionUiLayout(tft.width(),tft.height());
+        lastTouchAt=millis(); swallowWakeTouch=true;
+    }
+}
+
+void initTouch() {
+    pinMode(board::TOUCH_RST, OUTPUT);
+    digitalWrite(board::TOUCH_RST, HIGH);
+    delay(10);
+    digitalWrite(board::TOUCH_RST, LOW);
+    delay(20);
+    digitalWrite(board::TOUCH_RST, HIGH);
+    delay(200);
+
+    pinMode(board::TOUCH_INT, INPUT_PULLUP);
+    Wire.begin(board::TOUCH_SDA, board::TOUCH_SCL);
+    Wire.setClock(400000);
+    Wire.setTimeOut(20);
+    Wire.beginTransmission(board::TOUCH_I2C_ADDRESS);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("FT6336 not detected; running without touch");
+        return;
+    }
+
+    touchInput = lv_indev_create();
+    lv_indev_set_type(touchInput, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(touchInput, readTouchInput);
 }
 
 void pulseRandomButton() {
@@ -130,16 +280,80 @@ void updateRandomHudState() {
         updateRandomHud();
     }
 }
+
+void handleSerialCommands() {
+    static char command[96];
+    static size_t size = 0;
+    while (Serial.available()) {
+        const char value = Serial.read();
+        if (value == '\r') continue;
+        if (value != '\n') {
+            if (size < sizeof(command) - 1) command[size++] = value;
+            continue;
+        }
+        command[size] = '\0';
+        if (strcmp(command, "STATUS") == 0) {
+            Serial.printf("HUD iPhone running; heap=%u; touch=%s\n", ESP.getFreeHeap(),
+                          touchInput ? "FT6336 ready" : "unavailable");
+            phoneLinkPrintStatus();
+            companionUiPrintStatus();
+            hudSettingsPrintStatus();
+            aiVoicePrintStatus();
+            Serial.printf("Display idle: awake=%u; backlight=%u; idle_ms=%u; timeout_ms=%u\n",
+                          screenAwake, ledcRead(2),
+                          uint32_t(millis() - lastTouchAt), hudSettingsGet().timeoutSeconds * 1000UL);
+        } else if (strcmp(command, "REFRESH") == 0) {
+            const auto result = phoneLinkRefreshNotifications();
+            Serial.printf("ANCS refresh request: %u (0=queued, 1=offline, 2=pairing, 3=busy)\n",
+                          unsigned(result));
+        } else if (strncmp(command, "TIME ", 5) == 0) {
+            long long epoch;
+            int offsetMinutes;
+            if (sscanf(command + 5, "%lld %d", &epoch, &offsetMinutes) == 2 &&
+                epoch >= 1577836800LL && epoch <= 4102444800LL &&
+                offsetMinutes >= -720 && offsetMinutes <= 960) {
+                phone::ClockSample sample;
+                sample.utcSeconds = epoch;
+                sample.utcOffsetSeconds = offsetMinutes * 60;
+                companionUiSetTime(sample, false);
+                Serial.println("Clock set over USB; waiting for iPhone CTS sync");
+            } else {
+                Serial.println("Usage: TIME <unix-seconds> <UTC-offset-minutes>");
+            }
+        }
+        size = 0;
+    }
+}
 }
 
 void setup() {
     Serial.begin(115200);
     delay(200);
     randomSeed(micros());
+    hudSettingsBegin();
     initDisplay();
+    initTouch();
+    aiVoiceBegin();
+#ifdef HUD_DEMO_ONLY
     ui_init();
     updateRandomHud();
-    Serial.println("HUD display ready");
+#else
+    companionUiBegin();
+    companionUiLayout(tft.width(),tft.height());
+    lv_mem_monitor_t memory{}; lv_mem_monitor(&memory);
+    Serial.printf("LVGL PSRAM arena: total=%u; free=%u; largest=%u\n",
+        unsigned(memory.total_size),unsigned(memory.free_size),unsigned(memory.free_biggest_size));
+    if (!phoneLinkBegin()) {
+        Serial.println("Failed to initialize iPhone BLE link");
+        companionUiBluetoothFailed();
+    }
+#endif
+    Serial.printf("Display: %u x %u; flash: %u MB; PSRAM: %u KiB\n",
+                  SCREEN_WIDTH, SCREEN_HEIGHT,
+                  ESP.getFlashChipSize() / (1024 * 1024),
+                  ESP.getPsramSize() / 1024);
+    Serial.println("HUD iPhone ready");
+    lastTouchAt = millis();
 }
 
 void loop() {
@@ -148,8 +362,18 @@ void loop() {
     lv_tick_inc(now - lastTick);
     lastTick = now;
 
+#ifdef HUD_DEMO_ONLY
     ui_tick();
     updateRandomHudState();
+#else
+    hudSettingsTick();
+    serviceHardwareSettings();
+    PhoneEvent event;
+    while (phoneLinkPoll(event)) companionUiHandle(event);
+    handleSerialCommands();
+    companionUiTick();
+#endif
     lv_timer_handler();
+    serviceDisplayTimeout();
     delay(5);
 }

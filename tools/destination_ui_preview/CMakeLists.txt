@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(HudDestinationPreview LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 11)
+get_filename_component(HUD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(LV_BUILD_CONF_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lv_conf.h" CACHE STRING "" FORCE)
+set(LV_BUILD_SET_CONFIG_OPTS OFF CACHE BOOL "" FORCE)
+set(LV_BUILD_USE_KCONFIG OFF CACHE BOOL "" FORCE)
+set(LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LV_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${HUD_ROOT}/.pio/libdeps/esp32-s3-devkitm-1/lvgl" lvgl)
+add_executable(hud_destination_preview main.cpp
+ "${HUD_ROOT}/lib/companion_fonts/hud_font_vietnamese.c"
+ "${HUD_ROOT}/lib/companion_fonts/hud_font_vietnamese_14.c")
+target_include_directories(hud_destination_preview PRIVATE "${HUD_ROOT}/lib/hud_destination_ui" "${HUD_ROOT}/lib/companion_fonts")
+target_link_libraries(hud_destination_preview PRIVATE lvgl)

@@ -1,7 +1,12 @@
 #include "companion_ui.h"
+#include "battery.h"
 #include "nav_stream.h"
 #include "hud_settings.h"
 #include "ai_voice.h"
+#include "wallpaper.h"
+#include <nvs.h>
+#include <esp_idf_version.h>
+#include <NimBLEDevice.h>
 #include <lunar_calendar.h>
 
 #include <Arduino.h>
@@ -13,10 +18,25 @@
 #include <math.h>
 #include <algorithm>
 #include <esp_heap_caps.h>
+#include <src/libs/tjpgd/tjpgd.h>
+#include <atomic>
 #include <ai_gesture.h>
 #include <hud_destination_ui.h>
 #include <ai_typewriter.h>
 
+uint8_t autoBrightnessLevel();
+void buildWallFace();
+void setIfChanged(lv_obj_t* obj, const char* text);
+// Style setters that skip unchanged values: every LVGL style write invalidates the
+// object, and over a photo each redraw is expensive.
+inline void textColorIfChanged(lv_obj_t* obj, uint32_t rgb) {
+    if ((lv_color_to_u32(lv_obj_get_style_text_color(obj, LV_PART_MAIN)) & 0xFFFFFF) != (rgb & 0xFFFFFF))
+        lv_obj_set_style_text_color(obj, lv_color_hex(rgb), 0);
+}
+inline void bgColorIfChanged(lv_obj_t* obj, uint32_t rgb) {
+    if ((lv_color_to_u32(lv_obj_get_style_bg_color(obj, LV_PART_MAIN)) & 0xFFFFFF) != (rgb & 0xFFFFFF))
+        lv_obj_set_style_bg_color(obj, lv_color_hex(rgb), 0);
+}
 namespace {
 uint32_t BG = 0x080E18;
 uint32_t PANEL = 0x111E30;
@@ -37,6 +57,8 @@ lv_obj_t* smallClock;
 lv_obj_t* lunarLabel;
 uint32_t swipeCount = 0;
 lv_obj_t* statusDot;
+lv_obj_t* batteryLabel;
+bool wakeRequested=false;
 lv_obj_t* clockLabel;
 lv_obj_t* dateLabel;
 lv_obj_t* extraLabel;
@@ -47,6 +69,20 @@ constexpr uint8_t SPEED_DIGITAL_FACE = 6, SPEED_DIAL_FACE = 7;
 lv_obj_t *speedDigital, *speedDigitalValue, *speedDigitalStatus, *speedDigitalClock, *speedDigitalDate;
 lv_obj_t *speedDial, *speedDialValue, *speedDialClock, *speedDialNeedle;
 lv_point_precise_t speedDialNeedlePoints[2];
+// Riding face: replaces the chosen face on page 0 while a trip is active.
+lv_obj_t *rideFace,*rideSpeed,*rideUnit,*rideClock,*rideDate,*rideWeather,*rideLeftTitle,*rideLeft,*rideCard,*rideArrow,*rideArrowIcon,*rideTurn,*rideStreet;
+bool rideVisible=false;   // ride face on screen (trip, or chosen as the default face)
+bool rideTrip=false;      // a trip is actually running
+constexpr uint8_t RIDE_FACE = 6;
+char lunarText[32] = "Âm --/--";
+// Photo background (any face) and the full-screen "iPhone" lock-screen face (8).
+constexpr uint8_t PHONE_FACE = 8;
+lv_obj_t *wallFace,*wallImage,*wallDim,*wallTopShade,*wallBottomShade,*wallDate,*wallClock,*wallHint,*wallPills[3],*wallPillValues[3];
+int wallState=-1;   // cached layout: -1 unknown, 0 off, 1 photo behind a face, 2 lock-screen layout
+lv_image_dsc_t wallDsc{};
+bool wallVisible=false;
+uint32_t wallShownRevision=0;
+bool rainWarned=false;
 float speedDialDisplayed = -1;
 uint32_t speedDialUpdatedAt = 0;
 uint32_t appliedRevision = 0;
@@ -66,7 +102,6 @@ lv_obj_t* inboxDetail;
 lv_obj_t* inboxTime;
 lv_obj_t* detailDelete;
 lv_obj_t* inboxRows[10];
-lv_obj_t* rowApps[10];
 lv_obj_t* rowTimes[10];
 lv_obj_t* rowTitles[10];
 lv_obj_t* rowContents[10];
@@ -136,11 +171,39 @@ lv_image_dsc_t mapFrame{};
 uint32_t mapReceivedAt = 0;
 bool mapLive = false;
 lv_obj_t* pairingPanel;
+// Owner-PIN gate shown before the pairing code when a PIN is set.
+lv_obj_t *pinPanel,*pinDots,*pinHint;
+char pinTyped[5]={};
+uint32_t pendingPasskey=0;
+bool pendingPasskeyValid=false;
+uint8_t pinFailures=0;
+uint32_t pinLockedUntil=0, pairUnlockedUntil=0;
+// Lock: without the owner's iPhone only the clock page is reachable.
+lv_obj_t *lockSheet,*lockPinButton;
+bool pinUnlocked=false, pinForUnlock=false;
+volatile bool pendingLockTap=false;
+uint32_t lockSheetUntil=0;
 lv_obj_t* pairingCode;
 lv_obj_t* musicTitle;
 lv_obj_t* musicArtist;
 lv_obj_t* musicStatus;
 lv_obj_t* musicVolume;
+lv_obj_t* musicVolumeBar;
+lv_obj_t* musicPlayer;
+lv_obj_t* rowBadges[10];
+lv_obj_t* rowBadgeText[10];
+// Quick settings (swipe down from the top edge).
+lv_obj_t* qsPanel=nullptr;
+// Device information screen, opened from quick settings.
+lv_obj_t *infoPanel=nullptr,*infoList=nullptr;
+constexpr int INFO_ROWS=20;
+lv_obj_t *infoValues[INFO_ROWS];
+uint32_t infoRefreshedAt=0;
+lv_obj_t *qsBrightValue,*qsVolumeValue,*qsTiles[3],*qsTileValues[3];
+volatile int pendingQs=0;            // set by the touch callback, applied in the tick
+bool quietNotices=false;            // "Im lặng": keep in inbox, no popup, no wake
+bool linkSecured=false;
+bool hudLocked() { return !linkSecured && !pinUnlocked; }
 constexpr int MUSIC_BUTTON_COUNT = 5;
 lv_obj_t* musicButtons[MUSIC_BUTTON_COUNT];
 lv_obj_t* musicPlayIcon;
@@ -171,6 +234,62 @@ uint32_t feedbackUntil = 0;
 const lv_font_t* textFont = &hud_font_vietnamese;
 bool homeFontsReady = false;
 void clearMaps(bool force);
+
+// Map JPEGs are decoded on a background task into RGB565 so the LVGL/touch loop
+// never stalls on a ~0.5 s software decode; LVGL then only blits ready pixels.
+constexpr size_t MAP_W=300, MAP_H=200;
+enum MapDecodeState : int { MAP_IDLE=0, MAP_DECODING, MAP_DONE, MAP_FAILED };
+uint16_t* mapPixels[2]={nullptr,nullptr};
+int mapPixelTarget=0;
+TaskHandle_t mapDecodeTask=nullptr;
+std::atomic<int> mapDecodeState{MAP_IDLE};
+const uint8_t* mapDecodeJpeg=nullptr;
+size_t mapDecodeSize=0;
+uint32_t mapDecodeMs=0;
+struct MapJpegSource { const uint8_t* data; size_t left; uint16_t* out; };
+size_t mapJpegInput(JDEC* jd,uint8_t* buffer,size_t size) {
+    auto* source=static_cast<MapJpegSource*>(jd->device);
+    if(size>source->left) size=source->left;
+    if(buffer) memcpy(buffer,source->data,size);
+    source->data+=size; source->left-=size;
+    return size;
+}
+// tjpgd delivers 8-bit B,G,R triplets per MCU rectangle; pack to native RGB565.
+int mapJpegOutput(JDEC* jd,void* bitmap,JRECT* rect) {
+    auto* source=static_cast<MapJpegSource*>(jd->device);
+    if(rect->right>=MAP_W || rect->bottom>=MAP_H) return 0;
+    const uint8_t* pixel=static_cast<const uint8_t*>(bitmap);
+    for(unsigned y=rect->top;y<=rect->bottom;++y) {
+        uint16_t* row=source->out+y*MAP_W;
+        for(unsigned x=rect->left;x<=rect->right;++x,pixel+=3)
+            row[x]=uint16_t(((pixel[2]&0xF8)<<8)|((pixel[1]&0xFC)<<3)|(pixel[0]>>3));
+    }
+    return 1;
+}
+bool decodeMapJpeg(const uint8_t* data,size_t size,uint16_t* out) {
+    static uint32_t pool[1024]; // 4 KiB tjpgd workspace; only the map task uses it.
+    MapJpegSource source{data,size,out};
+    JDEC decoder;
+    if(jd_prepare(&decoder,mapJpegInput,pool,sizeof(pool),&source)!=JDR_OK) return false;
+    if(decoder.width!=MAP_W || decoder.height!=MAP_H) return false;
+    return jd_decomp(&decoder,mapJpegOutput,0)==JDR_OK;
+}
+void mapDecodeWorker(void*) {
+    for(;;) {
+        ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
+        const uint32_t started=millis();
+        const bool ok=decodeMapJpeg(mapDecodeJpeg,mapDecodeSize,mapPixels[mapPixelTarget]);
+        mapDecodeMs=millis()-started;
+        mapDecodeState.store(ok ? MAP_DONE : MAP_FAILED,std::memory_order_release);
+    }
+}
+void startMapDecode(const uint8_t* jpeg,size_t size) {
+    if(!mapDecodeTask) return;
+    mapPixelTarget^=1;
+    mapDecodeJpeg=jpeg; mapDecodeSize=size;
+    mapDecodeState.store(MAP_DECODING,std::memory_order_release);
+    xTaskNotifyGive(mapDecodeTask);
+}
 void updateGoogleOverlay();
 void refreshInbox();
 
@@ -221,10 +340,12 @@ void applySettings() {
         {0xFFF0F5,0xFFFFFF,0xA32665,0x35202D,0x755B6C,0xF4DEEA,0xFBE8F1}
     };
     const Palette old{BG,PANEL,CYAN,WHITE,MUTED,BUTTON,OVERLAY};
-    const auto& next = palettes[config.theme];
+    // Over a photo, light themes switch to their dark twin so text stays readable.
+    const auto& next = palettes[wallpaperBackground() || config.face == PHONE_FACE ? config.theme % 4 : config.theme];
     BG=next.bg; PANEL=next.panel; CYAN=next.accent; WHITE=next.text;
     MUTED=next.muted; BUTTON=next.button; OVERLAY=next.overlay;
     recolor(root, old); recolor(noticePopup, old); recolor(pairingPanel, old);
+    if(qsPanel) recolor(qsPanel, old);
     lv_obj_set_style_border_color(noticePopup, lv_color_hex(CYAN), 0);
     lv_obj_set_style_border_color(pairingPanel, lv_color_hex(CYAN), 0);
     if(mapPanButton) lv_obj_set_style_border_color(mapPanButton,lv_color_hex(CYAN),LV_STATE_CHECKED);
@@ -237,8 +358,9 @@ void applySettings() {
     for (int i = 0; i < PAGE_COUNT; ++i) {
         lv_obj_set_style_bg_color(pageDots[i], lv_color_hex(i == currentPage ? CYAN : MUTED), 0);
     }
-    const bool speedDigitalFace = config.face == SPEED_DIGITAL_FACE;
-    const bool speedDialFace = config.face == SPEED_DIAL_FACE;
+    // Faces 6/7 used to be standalone speed faces; 6 is now the ride face and 7 is retired.
+    const bool speedDigitalFace = false;
+    const bool speedDialFace = false;
     const bool speedFace = speedDigitalFace || speedDialFace;
     const bool round = config.face == 2 || config.face == 5;
     const bool classic = config.face == 5;
@@ -263,6 +385,9 @@ void applySettings() {
     lv_obj_set_hidden(lunarLabel, speedFace);
     lv_obj_set_hidden(speedDigital, !speedDigitalFace);
     lv_obj_set_hidden(speedDial, !speedDialFace);
+    if (config.face == RIDE_FACE || config.face == PHONE_FACE) {
+        for (auto obj : {analog, clockLabel, dateLabel, extraLabel, lunarLabel}) lv_obj_set_hidden(obj, true);
+    }
     lv_obj_set_style_text_color(speedDigitalValue, lv_color_hex(WHITE), 0);
     lv_obj_set_style_text_color(speedDigitalClock, lv_color_hex(CYAN), 0);
     lv_obj_set_style_text_color(speedDigitalDate, lv_color_hex(MUTED), 0);
@@ -346,11 +471,11 @@ void showPage(int index) {
     }
     for (int i = 0; i < PAGE_COUNT; ++i) {
         lv_obj_set_hidden(pages[i], i != currentPage);
-        lv_obj_set_hidden(pageDots[i],viewHeight>viewWidth || i==AI_PAGE || currentPage==AI_PAGE);
+        lv_obj_set_hidden(pageDots[i],true);
         lv_obj_set_style_bg_color(pageDots[i], lv_color_hex(i == currentPage ? CYAN : MUTED), 0);
     }
     const char* names[] = {"ĐỒNG HỒ", "THÔNG BÁO", "BẢN ĐỒ", "NHẠC", "TRỢ LÝ AI"};
-    lv_label_set_text(pageHeading, currentPage==2 && mapPanMode ? "KÉO BẢN ĐỒ" : names[currentPage]);
+    lv_label_set_text(pageHeading, currentPage==2 && mapPanMode ? "KÉO BẢN ĐỒ" : currentPage==0 && hudLocked() ? "ĐÃ KHÓA" : currentPage==0 && rideVisible ? "ĐI XE" : names[currentPage]);
     if (deleteDialog && currentPage != 1) lv_obj_set_hidden(deleteDialog, true);
 }
 
@@ -415,20 +540,31 @@ void sortInbox() {
     if(count>10) count=10;
 }
 
-void setInboxPreview(lv_obj_t* target, const char* text) {
-    // Notification fields are bounded to 511 UTF-8 bytes. Flatten source line
-    // breaks so the list always has one title line and one content line.
-    char line[512];
-    size_t used=0;
-    for(const char* at=text; *at && used+1<sizeof(line); ++at) {
-        const char value=(*at=='\r' || *at=='\n' || *at=='\t') ? ' ' : *at;
-        if(value==' ' && (!used || line[used-1]==' ')) continue;
-        line[used++]=value;
+// iPhone text often carries emoji (🎁, ⚠️) that the bundled fonts lack and LVGL
+// draws as a box. Keep only code points the label's font can render; optionally
+// flatten line breaks for one-line rows. Spaces left by removed emoji collapse.
+void setFontSafeText(lv_obj_t* target, const char* text, bool flatten) {
+    const lv_font_t* font=lv_obj_get_style_text_font(target,LV_PART_MAIN);
+    char out[1024]; size_t used=0;
+    const auto* at=reinterpret_cast<const uint8_t*>(text ? text : "");
+    while(*at && used+5<sizeof(out)) {
+        uint32_t cp=*at; size_t n=1;
+        if(cp>=0xF0 && at[1] && at[2] && at[3]) { cp=((cp&7)<<18)|((at[1]&63)<<12)|((at[2]&63)<<6)|(at[3]&63); n=4; }
+        else if(cp>=0xE0 && at[1] && at[2]) { cp=((cp&15)<<12)|((at[1]&63)<<6)|(at[2]&63); n=3; }
+        else if(cp>=0xC0 && at[1]) { cp=((cp&31)<<6)|(at[1]&63); n=2; }
+        const uint8_t* bytes=at; at+=n;
+        if(cp=='\r' || cp=='\t' || (flatten && cp=='\n')) cp=' ';
+        if(cp==' ') { if(used && out[used-1]!=' ' && out[used-1]!='\n') out[used++]=' '; continue; }
+        if(cp=='\n') { while(used && out[used-1]==' ') --used; out[used++]='\n'; continue; }
+        lv_font_glyph_dsc_t glyph;
+        if(cp<0x20 || !lv_font_get_glyph_dsc(font,&glyph,cp,0)) continue;
+        if(n==1) out[used++]=char(cp); else { memcpy(out+used,bytes,n); used+=n; }
     }
-    while(used && line[used-1]==' ') --used;
-    line[used]=0;
-    lv_label_set_text(target,line);
+    while(used && (out[used-1]==' ' || out[used-1]=='\n')) --used;
+    out[used]=0;
+    if(strcmp(lv_label_get_text(target),out)) lv_label_set_text(target,out);
 }
+void setInboxPreview(lv_obj_t* target, const char* text) { setFontSafeText(target,text,true); }
 
 void refreshInbox() {
     if (!inboxList) return;
@@ -442,17 +578,24 @@ void refreshInbox() {
         lv_obj_set_hidden(inboxRows[i], i>=count);
         if (i>=count) continue;
         const auto& entry=notices[i];
-        lv_label_set_text(rowApps[i],appName(entry.app));
+        const char* app=appName(entry.app);
+        // Badge: first letter of the app name on a colour derived from the app id.
+        static const uint32_t badgeColors[]={0x3FA2F5,0xB78CFF,0x45D483,0xF5B83D,0xFF7A90,0x41DAF5};
+        uint32_t hash=5381; for(const char* p=entry.app;*p;++p) hash=hash*33+uint8_t(*p);
+        lv_obj_set_style_bg_color(rowBadges[i],lv_color_hex(badgeColors[hash%6]),0);
+        char initial[5]={}; size_t n=1; if(uint8_t(app[0])>=0xC0) { n=2; while(n<4 && (uint8_t(app[n])&0xC0)==0x80) ++n; }
+        memcpy(initial,app,std::min(n,strlen(app))); lv_label_set_text(rowBadgeText[i],initial);
         char stamp[32]; if (!sourceTime(entry,stamp,sizeof(stamp),false)) receivedTime(entry,stamp,sizeof(stamp),false);
         lv_label_set_text(rowTimes[i],stamp);
-        setInboxPreview(rowTitles[i],entry.deleting ? "Đang xóa trên iPhone..." : entry.title[0] ? entry.title : "Thông báo");
-        setInboxPreview(rowContents[i],entry.message[0] ? entry.message : "Không có nội dung xem trước");
+        setInboxPreview(rowTitles[i],entry.deleting ? "Đang xóa trên iPhone..." : entry.title[0] ? entry.title : app);
+        char preview[200]; snprintf(preview,sizeof(preview),"%s · %s",app,entry.message[0] ? entry.message : "Không có nội dung xem trước");
+        setInboxPreview(rowContents[i],preview);
     }
     if (detailOpen) {
         const auto& entry=notices[selected];
         lv_label_set_text(inboxApp,appName(entry.app));
-        lv_label_set_text(inboxTitle,entry.title);
-        lv_label_set_text(inboxBody,entry.message[0] ? entry.message : "iPhone không chia sẻ nội dung xem trước.");
+        setFontSafeText(inboxTitle,entry.title,false);
+        setFontSafeText(inboxBody,entry.message[0] ? entry.message : "iPhone không chia sẻ nội dung xem trước.",false);
         char arrived[32], source[32]; receivedTime(entry,arrived,sizeof(arrived),true);
         if (sourceTime(entry,source,sizeof(source),true)) lv_label_set_text_fmt(inboxTime,"iPhone: %s\nNhận: %s",source,arrived);
         else lv_label_set_text_fmt(inboxTime,"Nhận: %s",arrived);
@@ -502,8 +645,8 @@ void updateGoogleOverlay() {
         lv_label_set_text(googleHeading, "Google Maps");
         lv_label_set_text(googleText, "Chỉ dẫn đã cũ. Chờ cập nhật...");
     } else {
-        lv_label_set_text(googleHeading, googleGuide.title[0] ? googleGuide.title : "Google Maps");
-        lv_label_set_text(googleText, googleGuide.message[0] ? googleGuide.message : "Không có nội dung xem trước.");
+        setFontSafeText(googleHeading, googleGuide.title[0] ? googleGuide.title : "Google Maps", true);
+        setFontSafeText(googleText, googleGuide.message[0] ? googleGuide.message : "Không có nội dung xem trước.", true);
     }
 }
 
@@ -516,9 +659,9 @@ void showNavigationNotice(const phone::Notice& notice) {
     mapLive = false;
     if (mapImage) lv_obj_set_hidden(mapImage, true);
     lv_label_set_text(mapSource, appName(notice.app));
-    lv_label_set_text(mapTitle, notice.title[0] ? notice.title : appName(notice.app));
-    lv_label_set_text(mapBody, notice.message[0] ? notice.message :
-                      "iPhone chưa chia sẻ nội dung xem trước.");
+    setFontSafeText(mapTitle, notice.title[0] ? notice.title : appName(notice.app), false);
+    setFontSafeText(mapBody, notice.message[0] ? notice.message :
+                      "iPhone chưa chia sẻ nội dung xem trước.", false);
     lv_obj_scroll_to_y(lv_obj_get_parent(mapTitle), 0, LV_ANIM_OFF);
 }
 
@@ -616,6 +759,7 @@ void hidePopup() {
 }
 
 void onPopup(lv_event_t*) {
+    if (!popupUid) { hidePopup(); return; } // weather warning, not an inbox item
     detailUid=popupUid; detailOpen=true;
     refreshInbox();
     showPage(1);
@@ -624,13 +768,16 @@ void onPopup(lv_event_t*) {
 void onPopupClose(lv_event_t*) { hidePopup(); }
 
 void showNoticePopup(const phone::Notice& notice) {
+    if (quietNotices) return;
     if (notice.preExisting || currentPage == 1 || lv_obj_is_visible(pairingPanel)) return;
     if (currentPage == 2 && isNavigationApp(notice.app)) return;
     popupUid = notice.uid;
     popupUntil = millis() + 8000;
     lv_label_set_text(popupApp, appName(notice.app));
-    lv_label_set_text_fmt(popupText, "%s\n%s", notice.title[0] ? notice.title : "Thông báo mới",
-                         notice.message[0] ? notice.message : "Không có nội dung xem trước");
+    char popup[1100];
+    snprintf(popup, sizeof(popup), "%s\n%s", notice.title[0] ? notice.title : "Thông báo mới",
+             notice.message[0] ? notice.message : "Không có nội dung xem trước");
+    setFontSafeText(popupText, popup, false);
     lv_obj_set_hidden(noticePopup, false);
 }
 
@@ -673,12 +820,17 @@ void resetMusic() {
     lv_label_set_text(musicTitle, "Mở nhạc trên iPhone");
     lv_label_set_text(musicArtist, "Tên bài và ca sĩ sẽ hiện ở đây");
     lv_label_set_text(musicStatus, "Chờ trình phát nhạc");
-    lv_label_set_text(musicVolume, LV_SYMBOL_VOLUME_MID " --%");
+    lv_label_set_text(musicVolume, "--%");
+    lv_bar_set_value(musicVolumeBar, 0, LV_ANIM_OFF);
+    lv_label_set_text(musicPlayer, "Nhạc iPhone");
     updateMusicControls();
 }
 
 void onGesture(lv_event_t* event) {
+    if(hudLocked()) return;
+    if(infoPanel && lv_obj_is_visible(infoPanel)) return;
     if(currentPage==AI_PAGE || aiGesture.consumes()) return;
+    if(qsPanel && !lv_obj_is_hidden(qsPanel)) return;
     if (mapPanMode && lv_event_get_target(event)==mapImage) return;
     auto input = lv_indev_active();
     if (!input) return;
@@ -760,7 +912,7 @@ void updateMapChrome(uint32_t now) {
     lv_label_set_text(lv_obj_get_child(mapMenuButton,0),mapMenuOpen ? LV_SYMBOL_CLOSE : LV_SYMBOL_LIST);
     lv_obj_set_hidden(speedBox,!mapLive || controls || modal);
     lv_obj_set_hidden(mapSearchButton,modal || !controls);
-    lv_obj_set_pos(mapSearchButton,mapTripActive ? 172 : 262,mapTripActive ? 121 : 3);
+    lv_obj_set_pos(mapSearchButton,mapTripActive ? 172 : 262,mapTripActive ? 163 : 3);
     const bool home=!mapTripActive && !modal;
     lv_obj_set_hidden(mapHomeUi.panel,!home);
     if(home) {
@@ -813,6 +965,9 @@ void onMapSearchChoose(lv_event_t* event) {
 void onMapSearchStart(lv_event_t*) {
     if(aiVoiceDestinationControl(2)) { lv_obj_set_hidden(mapSearchPanel,true); mapSearchRevision=UINT32_MAX; }
 }
+// Latest recognized speech for the map search panel (copied in companionUiTick).
+char heardQuestion[192]="";
+bool aiRecordingNow=false;
 void refreshMapSearch() {
     if(!mapSearchPanel || lv_obj_is_hidden(mapSearchPanel)) return;
     aiVoiceDestinationRead(mapSearchState);
@@ -820,7 +975,8 @@ void refreshMapSearch() {
     const char* message=mapSearchState.status[0] ? mapSearchState.status : voiceStatus;
     const char* items[5]; for(int i=0;i<5;++i) items[i]=mapSearchState.items[i];
     mapSearchUi.show(mapSearchState.phase,message[0] ? message : "Giữ mic rồi nói địa điểm",
-        mapSearchState.count,items,lv_obj_get_width(mapSearchPanel),lv_obj_get_height(mapSearchPanel),mapSearchState.session);
+        mapSearchState.count,items,lv_obj_get_width(mapSearchPanel),lv_obj_get_height(mapSearchPanel),mapSearchState.session,
+        heardQuestion);
 
 }
 void onMapTouch(lv_event_t* event) {
@@ -885,7 +1041,7 @@ void executeAiTool(const AiToolRequest& request) {
     } else if(request.action>=4 && request.action<=6) {
         auto settings=hudSettingsGet(); bool valid=true;
         if(request.action==4) { valid=request.value<8; settings.theme=request.value; }
-        if(request.action==5) { valid=request.value<8; settings.face=request.value; }
+        if(request.action==5) { valid=request.value<9; settings.face=request.value; }
         if(request.action==6) settings.timeoutSeconds=request.value;
         ok=valid && hudSettingsApply(settings);
         strlcpy(output,ok ? "Đã lưu và áp dụng cài đặt lên HUD." : "Cài đặt không hợp lệ hoặc chưa lưu được.",sizeof(output));
@@ -901,7 +1057,7 @@ void renderAiMessage(size_t index,bool assistant,bool waiting) {
     char* text=assistant ? turn.answer : turn.question;
     const size_t shown=assistant ? turn.shownAnswerBytes : strlen(text);
     const char saved=text[shown]; text[shown]=0;
-    lv_label_set_text(aiBodies[row],text[0] ? text : (waiting ? "Đang trả lời..." : "Không có câu trả lời"));
+    lv_label_set_text(aiBodies[row],text[0] ? text : (waiting ? (aiRecordingNow ? "Đang nghe..." : "Đang trả lời...") : "Không có câu trả lời"));
     text[shown]=saved;
     lv_obj_update_layout(aiBodies[row]);
     const int height=lv_obj_get_height(aiBodies[row])+38;
@@ -957,16 +1113,298 @@ void updateAiTyping(uint32_t now,const AiVoiceView& view) {
         lv_label_set_text(aiStatus,typing ? "AI đang trả lời..." : view.status);
     }
 }
+
+// A pill whose icon and text are centred by flex layout (no hand-placed offsets).
+lv_obj_t* pillButton(lv_obj_t* parent,int x,int y,int w,int h,const char* icon,const char* text,uint32_t fill) {
+    auto button=lv_button_create(parent);
+    lv_obj_set_pos(button,x,y); lv_obj_set_size(button,w,h);
+    lv_obj_set_style_radius(button,h/2,0); lv_obj_set_style_shadow_width(button,0,0);
+    lv_obj_set_style_bg_color(button,lv_color_hex(fill),0);
+    lv_obj_set_style_pad_all(button,0,0);
+    lv_obj_set_flex_flow(button,LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(button,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(button,8,0);
+    if(icon) {
+        auto i=lv_label_create(button); lv_label_set_text(i,icon);
+        lv_obj_set_style_text_font(i,&lv_font_montserrat_18,0); lv_obj_set_style_text_color(i,lv_color_hex(WHITE),0);
+    }
+    auto t=lv_label_create(button); lv_label_set_text(t,text);
+    lv_obj_set_style_text_font(t,textFont,0); lv_obj_set_style_text_color(t,lv_color_hex(WHITE),0);
+    return button;
+}
+// ---------------- Device information ----------------
+const char* const INFO_LABELS[INFO_ROWS] = {
+    "#Chip", "Mẫu chip", "CPU", "Nhiệt độ chip", "Đã chạy",
+    "#Bộ nhớ", "Chương trình", "RAM trống", "PSRAM trống", "Ảnh nền (LittleFS)", "Cài đặt (NVS)",
+    "#Pin", "Pin", "Điện áp",
+    "#Kết nối", "iPhone", "Bluetooth MAC",
+    "#Phần mềm", "Firmware", "ESP-IDF / LVGL"};
+
+void formatBytes(char* out, size_t size, size_t bytes) {
+    if (bytes >= 1024 * 1024) snprintf(out, size, "%u,%u MB", unsigned(bytes / 1048576), unsigned(bytes % 1048576 * 10 / 1048576));
+    else snprintf(out, size, "%u KB", unsigned((bytes + 512) / 1024));
+}
+
+void refreshInfoPanel() {
+    char a[24], b[24], v[64];
+    auto set = [&](int row, const char* text) { if (infoValues[row]) setIfChanged(infoValues[row], text); };
+    snprintf(v, sizeof(v), "%s rev %u", ESP.getChipModel(), unsigned(ESP.getChipRevision())); set(1, v);
+    snprintf(v, sizeof(v), "%u nhân · %u MHz", unsigned(ESP.getChipCores()), unsigned(ESP.getCpuFreqMHz())); set(2, v);
+    snprintf(v, sizeof(v), "%.0f °C", temperatureRead()); set(3, v);
+    const uint32_t up = millis() / 1000;
+    if (up >= 3600) snprintf(v, sizeof(v), "%u giờ %u phút", unsigned(up / 3600), unsigned(up / 60 % 60));
+    else snprintf(v, sizeof(v), "%u phút %u giây", unsigned(up / 60), unsigned(up % 60));
+    set(4, v);
+    const size_t sketch = ESP.getSketchSize(), slot = sketch + ESP.getFreeSketchSpace();
+    formatBytes(a, sizeof(a), sketch); formatBytes(b, sizeof(b), slot);
+    snprintf(v, sizeof(v), "%s / %s (%u%%)", a, b, unsigned(slot ? sketch * 100 / slot : 0)); set(6, v);
+    formatBytes(a, sizeof(a), ESP.getFreeHeap()); formatBytes(b, sizeof(b), ESP.getHeapSize());
+    snprintf(v, sizeof(v), "%s / %s", a, b); set(7, v);
+    formatBytes(a, sizeof(a), ESP.getFreePsram()); formatBytes(b, sizeof(b), ESP.getPsramSize());
+    snprintf(v, sizeof(v), "%s / %s", a, b); set(8, v);
+    size_t used = 0, total = 0;
+    if (wallpaperStorage(used, total)) {
+        formatBytes(a, sizeof(a), total - used); formatBytes(b, sizeof(b), total);
+        snprintf(v, sizeof(v), "trống %s / %s", a, b);
+    } else strlcpy(v, "chưa sẵn sàng", sizeof(v));
+    set(9, v);
+    nvs_stats_t nvs{};
+    if (nvs_get_stats(nullptr, &nvs) == ESP_OK)
+        snprintf(v, sizeof(v), "%u / %u ô trống", unsigned(nvs.free_entries), unsigned(nvs.total_entries));
+    else strlcpy(v, "--", sizeof(v));
+    set(10, v);
+    const BatteryStatus bat = batteryRead();
+    if (bat.present) snprintf(v, sizeof(v), "%d%%%s", bat.percent, bat.charging ? " · đang sạc" : "");
+    else strlcpy(v, "không có pin", sizeof(v));
+    set(12, v);
+    snprintf(v, sizeof(v), "%d mV", bat.millivolts); set(13, v);
+    set(15, !phoneLinkEnabled() ? "BLE đang tắt" : linkSecured ? "Đã kết nối" : "Chưa kết nối");
+    set(16, NimBLEDevice::getAddress().toString().c_str());
+    set(18, __DATE__ " " __TIME__);
+    snprintf(v, sizeof(v), "%s / %d.%d.%d", esp_get_idf_version(), LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
+    set(19, v);
+}
+
+// Back to the quick-settings panel it was opened from.
+void closeInfoPanel() {
+    lv_obj_set_hidden(infoPanel, true);
+    pendingQs = 1;
+}
+
+void onInfoGesture(lv_event_t*) {
+    auto input = lv_indev_active();
+    if (!input || lv_indev_get_gesture_dir(input) != LV_DIR_RIGHT) return;
+    lv_indev_wait_release(input);
+    closeInfoPanel();
+}
+
+void openInfoPanel() {
+    if (qsPanel) lv_obj_set_hidden(qsPanel, true);
+    refreshInfoPanel(); infoRefreshedAt = millis();
+    lv_obj_scroll_to_y(infoList, 0, LV_ANIM_OFF);
+    lv_obj_set_hidden(infoPanel, false);
+    lv_obj_move_foreground(infoPanel);
+}
+
+void buildInfoPanel() {
+    infoPanel = box(lv_layer_top(), 0, 0, 320, 240, BG);
+    lv_obj_set_style_radius(infoPanel, 0, 0);
+    lv_obj_set_gesture_bubble(infoPanel, false);
+    lv_obj_add_flag(infoPanel, LV_OBJ_FLAG_CLICKABLE);
+    // Back: a large pill away from the bezel, or swipe right anywhere.
+    auto back = pillButton(infoPanel, 8, 4, 128, 40, LV_SYMBOL_LEFT, "Quay lại", BUTTON);
+    lv_obj_add_event_cb(back, [](lv_event_t*) { closeInfoPanel(); }, LV_EVENT_CLICKED, nullptr);
+    auto title = label(infoPanel, 144, 15, 168, "THÔNG TIN THIẾT BỊ", CYAN, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_add_event_cb(infoPanel, onInfoGesture, LV_EVENT_GESTURE, nullptr);
+    infoList = box(infoPanel, 6, 50, 308, 188, BG);
+    lv_obj_set_scrollable(infoList, true); lv_obj_set_scroll_dir(infoList, LV_DIR_VER);
+    lv_obj_set_gesture_bubble(infoList, false);
+    lv_obj_add_event_cb(infoList, onInfoGesture, LV_EVENT_GESTURE, nullptr);
+    int y = 0;
+    for (int i = 0; i < INFO_ROWS; ++i) {
+        infoValues[i] = nullptr;
+        if (INFO_LABELS[i][0] == '#') { // section header
+            label(infoList, 6, y + (i ? 6 : 0), 290, INFO_LABELS[i] + 1, CYAN, &hud_font_vietnamese_14);
+            y += i ? 28 : 22; continue;
+        }
+        auto row = box(infoList, 0, y, 296, 26, PANEL);
+        lv_obj_set_style_radius(row, 8, 0);
+        label(row, 8, 4, 120, INFO_LABELS[i], MUTED, &hud_font_vietnamese_14);
+        infoValues[i] = label(row, 120, 4, 170, "", WHITE, &hud_font_vietnamese_14);
+        lv_obj_set_style_text_align(infoValues[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(infoValues[i], LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(infoValues[i], 18);
+        y += 30;
+    }
+    lv_obj_set_hidden(infoPanel, true);
+}
+
+void updateInfoPanel(uint32_t now) {
+    if (!infoPanel || lv_obj_is_hidden(infoPanel)) return;
+    if (hudLocked()) { lv_obj_set_hidden(infoPanel, true); return; }
+    if (now - infoRefreshedAt >= 1000) { infoRefreshedAt = now; refreshInfoPanel(); }
+}
+
+// ---------------- Quick settings ----------------
+constexpr uint16_t QS_TIMEOUTS[]={15,30,60,120,300,0};
+void refreshQuickSettings() {
+    if(!qsPanel) return;
+    const auto& hw=hudHardwareSettingsGet();
+    if(hudAutoBrightness()) lv_label_set_text_fmt(qsBrightValue,"Tự động · %u%%",unsigned(autoBrightnessLevel()));
+    else lv_label_set_text_fmt(qsBrightValue,"%u%%",unsigned(hw.brightness));
+    lv_obj_set_style_text_color(qsBrightValue,lv_color_hex(hudAutoBrightness() ? CYAN : WHITE),0);
+    if(hw.speakerVolume) lv_label_set_text_fmt(qsVolumeValue,"%u%%",unsigned(hw.speakerVolume));
+    else lv_label_set_text(qsVolumeValue,"Tắt tiếng");
+    const uint16_t t=hudSettingsGet().timeoutSeconds;
+    char timeout[24];
+    if(!t) strlcpy(timeout,"Luôn sáng",sizeof(timeout));
+    else if(t<60) snprintf(timeout,sizeof(timeout),"%u giây",unsigned(t));
+    else snprintf(timeout,sizeof(timeout),"%u phút",unsigned(t/60));
+    lv_label_set_text(qsTileValues[0],timeout);
+    lv_label_set_text(qsTileValues[1],quietNotices ? "Im lặng" : "Bật");
+    lv_label_set_text(qsTileValues[2],!phoneLinkEnabled() ? "Đã tắt" : linkSecured ? "iPhone" : "Chờ kết nối");
+    const bool on[]={false,!quietNotices,phoneLinkEnabled()};
+    for(int i=0;i<3;++i) {
+        lv_obj_set_style_bg_color(qsTiles[i],lv_color_hex(on[i] ? CYAN : BUTTON),0);
+        const uint32_t ink=on[i] ? BG : WHITE;
+        lv_obj_set_style_text_color(lv_obj_get_child(qsTiles[i],0),lv_color_hex(on[i] ? BG : MUTED),0);
+        lv_obj_set_style_text_color(qsTileValues[i],lv_color_hex(ink),0);
+    }
+}
+void onQuickSetting(lv_event_t* event) {
+    const int action=int(reinterpret_cast<intptr_t>(lv_event_get_user_data(event)));
+    if(action<=3) {
+        HudHardwareSettings hw=hudHardwareSettingsGet();
+        // Manual +/- leaves automatic mode, starting from the level shown now.
+        if(action<=1 && hudAutoBrightness()) { hw.brightness=autoBrightnessLevel(); hudSetAutoBrightness(false); }
+        if(action==0) hw.brightness=uint8_t(std::max(10,int(hw.brightness)-10));
+        if(action==1) hw.brightness=uint8_t(std::min(100,int(hw.brightness)+10));
+        if(action==2) hw.speakerVolume=uint8_t(std::max(0,int(hw.speakerVolume)-10));
+        if(action==3) hw.speakerVolume=uint8_t(std::min(100,int(hw.speakerVolume)+10));
+        hudHardwareSettingsApply(hw);
+    } else if(action==4) {
+        HudSettings settings=hudSettingsGet();
+        size_t index=0; while(index<6 && QS_TIMEOUTS[index]!=settings.timeoutSeconds) ++index;
+        settings.timeoutSeconds=QS_TIMEOUTS[(index+1)%6];
+        hudSettingsApply(settings);
+    } else if(action==5) quietNotices=!quietNotices;
+    else if(action==6) phoneLinkSetEnabled(!phoneLinkEnabled());
+    else if(action==7) hudSetAutoBrightness(!hudAutoBrightness());
+    else if(action==8) { openInfoPanel(); return; }
+    refreshQuickSettings();
+}
+lv_obj_t* qsButton(lv_obj_t* parent,int x,int y,const char* text,int action) {
+    auto button=lv_button_create(parent);
+    lv_obj_set_pos(button,x,y); lv_obj_set_size(button,56,44);
+    lv_obj_set_style_radius(button,22,0); lv_obj_set_style_shadow_width(button,0,0);
+    lv_obj_set_style_bg_color(button,lv_color_hex(BUTTON),0);
+    auto caption=label(button,0,0,40,text,WHITE,&lv_font_montserrat_22);
+    lv_obj_set_style_text_align(caption,LV_TEXT_ALIGN_CENTER,0); lv_obj_center(caption);
+    lv_obj_add_event_cb(button,onQuickSetting,LV_EVENT_CLICKED,reinterpret_cast<void*>(intptr_t(action)));
+    return button;
+}
+void buildQuickSettings() {
+    qsPanel=box(lv_layer_top(),0,0,320,240,BG);
+    lv_obj_set_style_radius(qsPanel,0,0);
+    lv_obj_set_style_bg_opa(qsPanel,LV_OPA_COVER,0);
+    lv_obj_set_gesture_bubble(qsPanel,false);
+    label(qsPanel,12,5,170,"ĐIỀU KHIỂN NHANH",CYAN,&hud_font_vietnamese_14);
+    const char* names[]={"Độ sáng","Âm lượng loa HUD"};
+    lv_obj_t** values[]={&qsBrightValue,&qsVolumeValue};
+    for(int r=0;r<2;++r) {
+        auto row=box(qsPanel,10,26+r*54,300,50,PANEL); lv_obj_set_style_radius(row,14,0);
+        qsButton(row,3,3,LV_SYMBOL_MINUS,r*2);
+        if(r==0) { // tapping the middle of the brightness row toggles automatic mode
+            auto middle=box(row,62,0,176,50,PANEL);
+            lv_obj_add_flag(middle,LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(middle,onQuickSetting,LV_EVENT_CLICKED,reinterpret_cast<void*>(intptr_t(7)));
+        }
+        auto name=label(row,62,4,176,r==0 ? "Độ sáng · chạm: tự động" : names[r],MUTED,&hud_font_vietnamese_14);
+        lv_obj_set_style_text_align(name,LV_TEXT_ALIGN_CENTER,0);
+        *values[r]=label(row,62,22,176,"--",WHITE,textFont);
+        lv_obj_set_style_text_align(*values[r],LV_TEXT_ALIGN_CENTER,0);
+        qsButton(row,241,3,LV_SYMBOL_PLUS,r*2+1);
+    }
+    const char* tiles[]={"Tự tắt","Thông báo","BLE"};
+    for(int i=0;i<3;++i) {
+        qsTiles[i]=box(qsPanel,10+i*102,136,96,54,BUTTON);
+        lv_obj_set_style_radius(qsTiles[i],14,0);
+        lv_obj_add_flag(qsTiles[i],LV_OBJ_FLAG_CLICKABLE);
+        label(qsTiles[i],10,5,80,tiles[i],MUTED,&hud_font_vietnamese_14);
+        qsTileValues[i]=label(qsTiles[i],10,25,82,"",WHITE,textFont);
+        lv_label_set_long_mode(qsTileValues[i],LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(qsTileValues[i],24);
+        lv_obj_add_event_cb(qsTiles[i],onQuickSetting,LV_EVENT_CLICKED,reinterpret_cast<void*>(intptr_t(4+i)));
+    }
+    // Bottom row: device information.
+    auto info=pillButton(qsPanel,10,194,300,44,LV_SYMBOL_SETTINGS,"Thông tin thiết bị",PANEL);
+    lv_obj_add_event_cb(info,onQuickSetting,LV_EVENT_CLICKED,reinterpret_cast<void*>(intptr_t(8)));
+    auto hint=label(qsPanel,150,5,160,"Vuốt lên để đóng",MUTED,&hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(hint,LV_TEXT_ALIGN_RIGHT,0);
+    lv_obj_set_hidden(qsPanel,true);
+}
+void applyPendingQuickSettings() {
+    const int request=pendingQs; pendingQs=0;
+    if(!request || !qsPanel) return;
+    if(request>0) { hidePopup(); refreshQuickSettings(); lv_obj_set_hidden(qsPanel,false); lv_obj_move_foreground(qsPanel); }
+    else lv_obj_set_hidden(qsPanel,true);
+}
+// Classifies quick-settings contacts. Returns true when the contact belongs to it.
+// A contact that starts in the top 48 px stays a normal touch (so nearby buttons
+// still work) until it clearly drags down; then the pending press is cancelled
+// and the drag belongs to quick settings.
+constexpr int QS_EDGE=48, QS_CLAIM=14, QS_OPEN=36;
+bool quickSettingsTouch(bool down,int x,int y,bool starting,bool wakeOnly) {
+    static bool tracking=false,swallow=false; static int startX=0,startY=0;
+    const bool open=qsPanel && !lv_obj_is_hidden(qsPanel);
+    if(starting) {
+        startX=x; startY=y; swallow=false;
+        // Not on the AI page: there swipe-down from the top closes AI.
+        tracking=!open && !wakeOnly && y<=QS_EDGE && currentPage!=AI_PAGE &&
+            !(pairingPanel && lv_obj_is_visible(pairingPanel)) && !(pinPanel && lv_obj_is_visible(pinPanel)) && !(infoPanel && lv_obj_is_visible(infoPanel));
+    }
+    if(tracking) {
+        const int dx=x-startX, dy=y-startY;
+        if(!down) { tracking=false; return false; }
+        if(dy<-6 || abs(dx)>dy+10) { tracking=false; return false; }   // not a downward drag
+        if(dy>=QS_CLAIM) {
+            if(auto input=lv_indev_active()) lv_indev_reset(input,nullptr);   // no click on what was under the finger
+            if(dy>=QS_OPEN) { pendingQs=1; tracking=false; swallow=true; }
+            return true;
+        }
+        return false;
+    }
+    if(swallow) { if(!down) swallow=false; return true; }
+    if(open) {
+        if(down && startY-y>=40) { pendingQs=-1; swallow=true; if(auto input=lv_indev_active()) lv_indev_reset(input,nullptr); return true; }
+        return false;   // buttons and tiles get normal LVGL presses
+    }
+    return false;
+}
 }
 
 bool companionUiTouch(bool down,int x,int y,bool wakeOnly) {
     if(!root || !aiListening) return false;
+    if(hudLocked()) {
+        // Locked: the lock sheet and PIN keypad take normal taps; anything else
+        // only opens the lock sheet on release.
+        if((lockSheet && !lv_obj_is_hidden(lockSheet)) || (pinPanel && !lv_obj_is_hidden(pinPanel))) return false;
+        static bool lockedDown=false;
+        if(!down && lockedDown && !wakeOnly) pendingLockTap=true;
+        lockedDown=down;
+        return true;
+    }
+    {
+        static bool qsPreviousDown=false;
+        const bool starting=down && !qsPreviousDown; qsPreviousDown=down;
+        if(quickSettingsTouch(down,x,y,starting,wakeOnly)) return true;
+        if(qsPanel && !lv_obj_is_hidden(qsPanel)) return false;
+    }
     // Keep the AI drawer reachable from destination results/confirmation.
     // Remember where this contact began so moving upwards does not suddenly
     // turn the same edge swipe into a blocked modal contact.
     static bool previousDown=false,mapSearchEdge=false;
     if(down && !previousDown) mapSearchEdge=mapSearchPanel && lv_obj_is_visible(mapSearchPanel) && y>=viewHeight-40;
-    const bool blocked=wakeOnly || (pairingPanel && lv_obj_is_visible(pairingPanel)) ||
+    const bool blocked=wakeOnly || (pairingPanel && lv_obj_is_visible(pairingPanel)) || (pinPanel && lv_obj_is_visible(pinPanel)) || (infoPanel && lv_obj_is_visible(infoPanel)) ||
         (deleteDialog && lv_obj_is_visible(deleteDialog)) || (mapStopDialog && lv_obj_is_visible(mapStopDialog)) || (mapSearchPanel && lv_obj_is_visible(mapSearchPanel) && !mapSearchEdge);
     const bool consumed=aiGesture.consumes();
     const auto action=aiGesture.update(down,x,y,millis(),currentPage==AI_PAGE,!aiVoiceBusy(),blocked,viewHeight);
@@ -995,6 +1433,134 @@ void applyPendingAiGesture() {
     }
 }
 
+void refreshPinPanel(const char* hint = nullptr) {
+    char dots[16] = {};
+    for (int i = 0; i < 4; ++i) strlcat(dots, i < int(strlen(pinTyped)) ? "* " : "- ", sizeof(dots));
+    lv_label_set_text(pinDots, dots);
+    if (hint) lv_label_set_text(pinHint, hint);
+}
+
+void showPinPanel() {
+    pinTyped[0] = 0;
+    const bool locked = pinLockedUntil && int32_t(pinLockedUntil - millis()) > 0;
+    refreshPinPanel(locked ? "Nhập sai nhiều lần. Thử lại sau 5 phút." :
+                    pinForUnlock ? "Nhập mã PIN chủ xe để mở khóa HUD." : "iPhone lạ đang xin kết nối. Nhập mã PIN chủ xe.");
+    lv_obj_set_hidden(pinPanel, false);
+    lv_obj_move_foreground(pinPanel);
+}
+
+void onPinKey(lv_event_t* event) {
+    const int key = int(reinterpret_cast<intptr_t>(lv_event_get_user_data(event)));
+    if (pinLockedUntil && int32_t(pinLockedUntil - millis()) > 0) { refreshPinPanel("Nhập sai nhiều lần. Thử lại sau 5 phút."); return; }
+    const size_t n = strlen(pinTyped);
+    if (key == 10) { lv_obj_set_hidden(pinPanel, true); pinTyped[0] = 0; pinForUnlock = false; return; }   // Hủy
+    if (key == 11) { if (n) pinTyped[n - 1] = 0; refreshPinPanel(); return; }        // Xóa
+    if (n >= 4) return;
+    pinTyped[n] = char('0' + key); pinTyped[n + 1] = 0;
+    refreshPinPanel();
+    if (n + 1 < 4) return;
+    if (hudOwnerPinMatches(pinTyped) && pinForUnlock) {
+        pinFailures = 0; pinForUnlock = false; pinUnlocked = true; pinTyped[0] = 0;
+        lv_obj_set_hidden(pinPanel, true); lv_obj_set_hidden(lockSheet, true);
+        showPage(currentPage);
+        return;
+    }
+    if (hudOwnerPinMatches(pinTyped)) {
+        pinFailures = 0;
+        pairUnlockedUntil = (millis() + 180000) | 1;
+        lv_obj_set_hidden(pinPanel, true);
+        if (pendingPasskeyValid) {
+            lv_label_set_text_fmt(pairingCode, "%06u", unsigned(pendingPasskey));
+            lv_obj_set_hidden(pairingPanel, false);
+        }
+        pinTyped[0] = 0;
+        return;
+    }
+    pinTyped[0] = 0;
+    if (++pinFailures >= 5) { pinFailures = 0; pinLockedUntil = (millis() + 300000) | 1; refreshPinPanel("Nhập sai nhiều lần. Thử lại sau 5 phút."); }
+    else { char text[64]; snprintf(text, sizeof(text), "Sai mã PIN. Còn %u lần thử.", unsigned(5 - pinFailures)); refreshPinPanel(text); }
+}
+
+void buildPinPanel() {
+    pinPanel = box(lv_layer_top(), 0, 0, 320, 240, BG);
+    lv_obj_set_style_radius(pinPanel, 0, 0);
+    lv_obj_set_gesture_bubble(pinPanel, false);
+    lv_obj_add_flag(pinPanel, LV_OBJ_FLAG_CLICKABLE); // swallow touches meant for the pages below
+    label(pinPanel, 12, 4, 200, "MÃ PIN CHỦ XE", CYAN, &hud_font_vietnamese_14);
+    pinHint = label(pinPanel, 12, 22, 200, "", MUTED, &hud_font_vietnamese_14);
+    lv_label_set_long_mode(pinHint, LV_LABEL_LONG_MODE_WRAP);
+    pinDots = label(pinPanel, 12, 72, 200, "", WHITE, &lv_font_montserrat_34);
+    label(pinPanel, 12, 120, 196, "Quên mã: xóa mã trong app HUD Connect trên iPhone đã ghép.", MUTED, &hud_font_vietnamese_14);
+    // 3x4 keypad on the right: 1-9, Hủy, 0, Xóa
+    const char* caps[] = {"1","2","3","4","5","6","7","8","9","Hủy","0",LV_SYMBOL_BACKSPACE};
+    const int keys[] = {1,2,3,4,5,6,7,8,9,10,0,11};
+    for (int i = 0; i < 12; ++i) {
+        auto button = lv_button_create(pinPanel);
+        lv_obj_set_pos(button, 214 + (i % 3) * 35, 6 + (i / 3) * 58);
+        lv_obj_set_size(button, 33, 52);
+        lv_obj_set_style_radius(button, 10, 0); lv_obj_set_style_shadow_width(button, 0, 0);
+        lv_obj_set_style_bg_color(button, lv_color_hex(i == 9 ? 0x5A2330 : BUTTON), 0);
+        auto caption = label(button, 0, 0, 33, caps[i], WHITE, i == 9 ? &hud_font_vietnamese_14 : &lv_font_montserrat_22);
+        lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0); lv_obj_center(caption);
+        lv_obj_add_event_cb(button, onPinKey, LV_EVENT_CLICKED, reinterpret_cast<void*>(intptr_t(keys[i])));
+    }
+    lv_obj_set_hidden(pinPanel, true);
+}
+
+void onLockPin(lv_event_t*) {
+    lv_obj_set_hidden(lockSheet, true);
+    pinForUnlock = true;
+    showPinPanel();
+}
+
+void buildLockSheet() {
+    lockSheet = box(lv_layer_top(), 0, 0, 320, 240, BG);
+    lv_obj_set_style_radius(lockSheet, 0, 0);
+    lv_obj_set_gesture_bubble(lockSheet, false);
+    lv_obj_add_flag(lockSheet, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(lockSheet, [](lv_event_t*) { lv_obj_set_hidden(lockSheet, true); }, LV_EVENT_CLICKED, nullptr);
+    auto icon = label(lockSheet, 0, 22, 320, LV_SYMBOL_BLUETOOTH, CYAN, &lv_font_montserrat_34);
+    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+    auto title = label(lockSheet, 0, 70, 320, "HUD đã khóa", WHITE, &hud_font_vietnamese_24);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    auto body = label(lockSheet, 20, 104, 280, "Mở bằng iPhone của bạn: bật Bluetooth và HUD Connect, HUD sẽ tự mở.", MUTED, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lockPinButton = lv_button_create(lockSheet);
+    lv_obj_set_pos(lockPinButton, 80, 160); lv_obj_set_size(lockPinButton, 160, 48);
+    lv_obj_set_style_radius(lockPinButton, 24, 0); lv_obj_set_style_shadow_width(lockPinButton, 0, 0);
+    lv_obj_set_style_bg_color(lockPinButton, lv_color_hex(CYAN), 0);
+    auto caption = label(lockPinButton, 0, 0, 150, "Nhập mã PIN", BG, &hud_font_vietnamese_24);
+    lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0); lv_obj_center(caption);
+    lv_obj_add_event_cb(lockPinButton, onLockPin, LV_EVENT_CLICKED, nullptr);
+    lv_obj_set_hidden(lockSheet, true);
+}
+
+void updateLock(uint32_t now) {
+    static bool wasLocked = false;
+    const bool locked = hudLocked();
+    if (locked != wasLocked) {
+        wasLocked = locked;
+        if (locked) {
+            if (qsPanel) lv_obj_set_hidden(qsPanel, true);
+            aiHolding = false; lv_obj_set_hidden(aiListening, true);
+            detailOpen = false;
+            if (currentPage != 0) showPage(0);
+        } else {
+            lv_obj_set_hidden(lockSheet, true);
+            if (!pendingPasskeyValid) lv_obj_set_hidden(pinPanel, true);
+        }
+        if (currentPage == 0) showPage(0); // refresh the heading
+    }
+    if (locked && pendingLockTap) {
+        pendingLockTap = false;
+        lv_obj_set_hidden(lockPinButton, !hudOwnerPinSet());
+        lv_obj_set_hidden(lockSheet, false); lv_obj_move_foreground(lockSheet);
+        lockSheetUntil = now + 8000;
+    }
+    pendingLockTap = false;
+    if (lockSheetUntil && int32_t(now - lockSheetUntil) >= 0) { lockSheetUntil = 0; lv_obj_set_hidden(lockSheet, true); }
+}
+
 void companionUiBegin() {
     const bool fontOk = fontRendersGlyph('A') && fontRendersGlyph(0x0111) &&
                         fontRendersGlyph(0x1ED9);
@@ -1009,18 +1575,26 @@ void companionUiBegin() {
     lv_text_get_size(&dateSize, "Chủ nhật, 31/10/2026", &hud_font_vietnamese_24, 0, 0, 1000, LV_TEXT_FLAG_NONE);
     Serial.printf("Home fonts: render=%s; clock=%dx%d; date=%dx%d (panel 300x200)\n",
                   homeFontsOk ? "OK" : "FAILED", int(clockSize.x), int(clockSize.y), int(dateSize.x), int(dateSize.y));
+    for(auto& buffer:mapPixels) buffer=static_cast<uint16_t*>(heap_caps_malloc(MAP_W*MAP_H*2,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    if(mapPixels[0] && mapPixels[1])
+        xTaskCreatePinnedToCore(mapDecodeWorker,"map-jpeg",8192,nullptr,1,&mapDecodeTask,0);
+    else Serial.println("Map decode buffers unavailable");
     root = box(nullptr, 0, 0, 320, 240, BG);
     lv_obj_set_gesture_bubble(root, false);
     lv_obj_set_style_radius(root, 0, 0);
     lv_obj_add_event_cb(root, onGesture, LV_EVENT_GESTURE, nullptr);
-    pageHeading = label(root, 12, 4, 155, "ĐỒNG HỒ", CYAN);
+    // Header: page title left, clock centred, battery + link dot right (no page dots).
+    pageHeading = label(root, 12, 4, 112, "ĐỒNG HỒ", CYAN);
+    lv_label_set_long_mode(pageHeading, LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(pageHeading, 24);
     for (int i = 0; i < PAGE_COUNT; ++i) {
-        pageDots[i] = box(root, 174 + i * 10, 15, 4, 4, MUTED);
+        pageDots[i] = box(root, 160 + i * 10, 15, 4, 4, MUTED);
         lv_obj_set_style_radius(pageDots[i], LV_RADIUS_CIRCLE, 0);
     }
-    smallClock=label(root,220,5,72,"--:--",WHITE,&lv_font_montserrat_18);
-    lv_obj_set_style_text_align(smallClock,LV_TEXT_ALIGN_RIGHT,0);
-    statusDot = box(root, 303, 12, 7, 7, MUTED);
+    smallClock=label(root,124,5,72,"--:--",WHITE,&lv_font_montserrat_18);
+    lv_obj_set_style_text_align(smallClock,LV_TEXT_ALIGN_CENTER,0);
+    batteryLabel=label(root,240,7,62,"",MUTED,&lv_font_montserrat_12);
+    lv_obj_set_style_text_align(batteryLabel,LV_TEXT_ALIGN_RIGHT,0);
+    statusDot = box(root, 306, 12, 7, 7, MUTED);
     lv_obj_set_style_radius(statusDot, LV_RADIUS_CIRCLE, 0);
 
     for (int i = 0; i < PAGE_COUNT; ++i) pages[i] = box(root, 10, 32, 300, 200, PANEL);
@@ -1092,24 +1666,53 @@ void companionUiBegin() {
     lv_obj_set_style_text_align(speedDialClock, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_hidden(speedDial, true);
 
-    inboxCount=label(pages[1],8,2,205,"0 thông báo",MUTED);
+    rideFace = box(pages[0], 0, 0, 300, 200, PANEL);
+    rideSpeed = label(rideFace, 2, -4, 160, "--", WHITE, &hud_font_clock_80);
+    rideUnit = label(rideFace, 6, 84, 100, "KM/H", MUTED, &hud_font_vietnamese_14);
+    rideClock = label(rideFace, 140, 0, 156, "--:--", WHITE, &lv_font_montserrat_34);
+    lv_obj_set_style_text_align(rideClock, LV_TEXT_ALIGN_RIGHT, 0);
+    rideDate = label(rideFace, 120, 38, 176, "", MUTED, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(rideDate, LV_TEXT_ALIGN_RIGHT, 0);
+    rideWeather = label(rideFace, 110, 58, 186, "", MUTED, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(rideWeather, LV_TEXT_ALIGN_RIGHT, 0);
+    rideLeftTitle = label(rideFace, 120, 82, 176, "Còn lại", MUTED, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(rideLeftTitle, LV_TEXT_ALIGN_RIGHT, 0);
+    rideLeft = label(rideFace, 120, 100, 176, "--", WHITE, &hud_font_vietnamese_24);
+    lv_obj_set_style_text_align(rideLeft, LV_TEXT_ALIGN_RIGHT, 0);
+    rideCard = box(rideFace, 0, 136, 300, 64, BUTTON);
+    lv_obj_set_style_radius(rideCard, 14, 0);
+    rideArrow = box(rideCard, 8, 9, 46, 46, 0x45D483);
+    lv_obj_set_style_radius(rideArrow, 12, 0);
+    rideArrowIcon = label(rideArrow, 0, 0, 46, LV_SYMBOL_UP, 0x04170C, &lv_font_montserrat_22);
+    lv_obj_set_style_text_align(rideArrowIcon, LV_TEXT_ALIGN_CENTER, 0); lv_obj_center(rideArrowIcon);
+    rideTurn = label(rideCard, 64, 4, 228, "", WHITE, &hud_font_vietnamese_24);
+    lv_label_set_long_mode(rideTurn, LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(rideTurn, 28);
+    rideStreet = label(rideCard, 64, 36, 228, "", MUTED, &hud_font_vietnamese_14);
+    lv_label_set_long_mode(rideStreet, LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(rideStreet, 20);
+    lv_obj_set_hidden(rideFace, true);
+
+    inboxCount=label(pages[1],8,2,205,"0 thông báo",WHITE);
     refreshButton=iconButton(pages[1],220,0,34,LV_SYMBOL_REFRESH,onRefresh);
     refreshCaption=lv_obj_get_child(refreshButton,0);
     inboxDeleteAll=iconButton(pages[1],262,0,34,LV_SYMBOL_TRASH,askDelete,reinterpret_cast<void*>(1));
     inboxList=box(pages[1],0,34,300,166,PANEL);
     lv_obj_set_scrollable(inboxList,true); lv_obj_set_scroll_dir(inboxList,LV_DIR_VER);
+    // Rows: app badge, sender/title, "App · preview", time. 58 px tall, 6 px apart.
     for (int i=0;i<10;++i) {
-        auto row=box(inboxList,4,i*82,287,77,BUTTON); inboxRows[i]=row;
+        auto row=box(inboxList,4,i*64,287,58,BUTTON); inboxRows[i]=row;
+        lv_obj_set_style_radius(row,12,0);
         lv_obj_set_clickable(row,true);
         lv_obj_add_event_cb(row,openNotice,LV_EVENT_CLICKED,reinterpret_cast<void*>(uintptr_t(i)));
-        rowApps[i]=label(row,7,3,195,"",CYAN,&hud_font_vietnamese_14);
-        lv_label_set_long_mode(rowApps[i],LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(rowApps[i],20);
-        rowTimes[i]=label(row,208,5,70,"",MUTED,&lv_font_montserrat_12);
-        lv_obj_set_style_text_align(rowTimes[i],LV_TEXT_ALIGN_RIGHT,0);
-        rowTitles[i]=label(row,7,23,271,"",WHITE,textFont);
+        rowBadges[i]=box(row,8,13,32,32,CYAN); lv_obj_set_style_radius(rowBadges[i],LV_RADIUS_CIRCLE,0);
+        lv_obj_remove_flag(rowBadges[i],LV_OBJ_FLAG_CLICKABLE);
+        rowBadgeText[i]=label(rowBadges[i],0,0,32,"",0x061016,textFont);
+        lv_obj_set_style_text_align(rowBadgeText[i],LV_TEXT_ALIGN_CENTER,0); lv_obj_align(rowBadgeText[i],LV_ALIGN_CENTER,0,0);
+        rowTitles[i]=label(row,48,5,186,"",WHITE,textFont);
         lv_label_set_long_mode(rowTitles[i],LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(rowTitles[i],24);
-        rowContents[i]=label(row,7,48,271,"",MUTED,textFont);
-        lv_label_set_long_mode(rowContents[i],LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(rowContents[i],24);
+        rowTimes[i]=label(row,236,8,44,"",MUTED,&lv_font_montserrat_12);
+        lv_obj_set_style_text_align(rowTimes[i],LV_TEXT_ALIGN_RIGHT,0);
+        rowContents[i]=label(row,48,31,232,"",MUTED,&hud_font_vietnamese_14);
+        lv_label_set_long_mode(rowContents[i],LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(rowContents[i],20);
         lv_obj_set_hidden(row,true);
     }
     inboxDetail=box(pages[1],0,0,300,200,PANEL);
@@ -1154,7 +1757,7 @@ void companionUiBegin() {
     lv_obj_set_style_bg_opa(speedBox,LV_OPA_90,0);
     speedLabel=label(speedBox,4,5,96,"--- km/h",WHITE,&lv_font_montserrat_18);
     lv_obj_set_style_text_align(speedLabel,LV_TEXT_ALIGN_CENTER,0);
-    mapControls=box(pages[2],8,118,246,38,OVERLAY);
+    mapControls=box(pages[2],8,160,246,38,OVERLAY);
     lv_obj_set_style_bg_opa(mapControls,LV_OPA_90,0);
     iconButton(mapControls,4,4,34,LV_SYMBOL_PLUS,onMapControl,reinterpret_cast<void*>(1));
     iconButton(mapControls,44,4,34,LV_SYMBOL_MINUS,onMapControl,reinterpret_cast<void*>(2));
@@ -1188,22 +1791,38 @@ void companionUiBegin() {
         textFont,cancelMapStop,confirmMapStop);
     mapStopMessage=lv_obj_get_child(mapStopDialog,0); lv_obj_set_hidden(mapStopDialog,true);
 
-    musicTitle = label(pages[3], 10, 14, 280, "Mở nhạc trên iPhone", WHITE, &hud_font_vietnamese_24);
+    // Music: source + state on top, big title, volume row, three large transport buttons.
+    label(pages[3], 10, 9, 18, LV_SYMBOL_AUDIO, CYAN, &lv_font_montserrat_14);
+    musicPlayer = label(pages[3], 30, 6, 150, "Nhạc iPhone", MUTED, &hud_font_vietnamese_14);
+    lv_label_set_long_mode(musicPlayer, LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(musicPlayer, 20);
+    musicStatus = label(pages[3], 170, 6, 120, "", CYAN, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(musicStatus, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(musicStatus, LV_LABEL_LONG_MODE_DOTS); lv_obj_set_height(musicStatus, 20);
+    musicTitle = label(pages[3], 10, 30, 280, "Mở nhạc trên iPhone", WHITE, &hud_font_vietnamese_24);
     lv_label_set_long_mode(musicTitle, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
-    musicArtist = label(pages[3], 10, 54, 280, "", CYAN);
+    musicArtist = label(pages[3], 10, 63, 280, "", MUTED);
     lv_label_set_long_mode(musicArtist, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
-    musicStatus = label(pages[3], 10, 94, 185, "", MUTED);
-    lv_label_set_long_mode(musicStatus, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_height(musicStatus, 24);
-    musicVolume = label(pages[3], 202, 96, 90, LV_SYMBOL_VOLUME_MID " --%", CYAN, &lv_font_montserrat_18);
+    musicVolumeBar = lv_bar_create(pages[3]);
+    lv_obj_set_pos(musicVolumeBar, 62, 111); lv_obj_set_size(musicVolumeBar, 138, 8);
+    lv_bar_set_range(musicVolumeBar, 0, 100);
+    lv_obj_set_style_bg_color(musicVolumeBar, lv_color_hex(BUTTON), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(musicVolumeBar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(musicVolumeBar, lv_color_hex(CYAN), LV_PART_INDICATOR);
+    musicVolume = label(pages[3], 202, 105, 44, "--%", WHITE, &lv_font_montserrat_14);
+    lv_obj_set_style_text_align(musicVolume, LV_TEXT_ALIGN_CENTER, 0);
     const char* controls[] = {LV_SYMBOL_MINUS, LV_SYMBOL_PREV, LV_SYMBOL_PLAY, LV_SYMBOL_NEXT, LV_SYMBOL_PLUS};
+    const int bx[] = {10, 10, 100, 210, 248}, by[] = {98, 142, 142, 142, 98};
+    const int bw[] = {44, 80, 100, 80, 44}, bh[] = {34, 52, 52, 52, 34};
     for (int i = 0; i < MUSIC_BUTTON_COUNT; ++i) {
         musicButtons[i] = lv_button_create(pages[3]);
-        lv_obj_set_pos(musicButtons[i], 10 + i * 58, 142);
-        lv_obj_set_size(musicButtons[i], 48, 48);
-        lv_obj_set_style_bg_color(musicButtons[i], lv_color_hex(0x214358), 0);
+        lv_obj_set_pos(musicButtons[i], bx[i], by[i]);
+        lv_obj_set_size(musicButtons[i], bw[i], bh[i]);
+        lv_obj_set_style_radius(musicButtons[i], bh[i] / 2, 0);
+        lv_obj_set_style_shadow_width(musicButtons[i], 0, 0);
+        lv_obj_set_style_bg_color(musicButtons[i], lv_color_hex(i == 2 ? CYAN : BUTTON), 0);
         lv_obj_set_style_pad_all(musicButtons[i], 0, 0);
-        auto icon = label(musicButtons[i], 0, 0, 40, controls[i], CYAN, &lv_font_montserrat_24);
+        auto icon = label(musicButtons[i], 0, 0, 40, controls[i], i == 2 ? BG : WHITE,
+                          i == 0 || i == 4 ? &lv_font_montserrat_18 : &lv_font_montserrat_24);
         lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(icon);
         if (i == 2) musicPlayIcon = icon;
@@ -1275,6 +1894,11 @@ void companionUiBegin() {
     lv_obj_set_style_text_align(pairingCode, LV_TEXT_ALIGN_CENTER, 0);
     label(pairingPanel, 12, 91, 270, "Sau đó cho phép chia sẻ thông báo hệ thống.", MUTED);
     lv_obj_set_hidden(pairingPanel, true);
+    buildQuickSettings();
+    buildPinPanel();
+    buildInfoPanel();
+    buildWallFace();
+    buildLockSheet();
     refreshInbox();
     showPage(0);
     lv_screen_load(root);
@@ -1318,11 +1942,19 @@ void companionUiHandle(const PhoneEvent& event) {
     case PhoneEventType::PairingCode:
         hidePopup();
         lv_label_set_text_fmt(pairingCode, "%06u", unsigned(event.value));
-        lv_obj_set_hidden(pairingPanel, false);
+        if (hudOwnerPinSet() && !(pairUnlockedUntil && int32_t(pairUnlockedUntil - millis()) > 0)) {
+            // A new iPhone is asking to pair: the code stays hidden until the owner PIN is typed.
+            pendingPasskey = event.value; pendingPasskeyValid = true;
+            pinForUnlock = false; lv_obj_set_hidden(lockSheet, true);
+            showPinPanel();
+        } else lv_obj_set_hidden(pairingPanel, false);
+        wakeRequested = true;
         break;
     case PhoneEventType::Secured:
+        linkSecured=true; pinUnlocked=false;
         status(0x69E4AA);
         lv_obj_set_hidden(pairingPanel, true);
+        lv_obj_set_hidden(pinPanel, true); pendingPasskeyValid = false;
         break;
     case PhoneEventType::NotificationsReady:
         hudSettingsRequestAppNames();
@@ -1382,6 +2014,7 @@ void companionUiHandle(const PhoneEvent& event) {
             selected = 0;
         }
         refreshInbox();
+        if(!event.notice.preExisting && !quietNotices) wakeRequested=true;
         showNoticePopup(event.notice);
         if (isNavigationApp(event.notice.app) && !mapLive) {
             showNavigationNotice(event.notice);
@@ -1426,10 +2059,10 @@ void companionUiHandle(const PhoneEvent& event) {
     case PhoneEventType::MusicUpdate:
         switch (event.music.field) {
         case phone::MusicField::Title:
-            lv_label_set_text(musicTitle, event.music.text[0] ? event.music.text : "Chưa có bài nhạc");
+            setFontSafeText(musicTitle, event.music.text[0] ? event.music.text : "Chưa có bài nhạc", true);
             break;
         case phone::MusicField::Artist:
-            lv_label_set_text(musicArtist, event.music.text);
+            setFontSafeText(musicArtist, event.music.text, true);
             break;
         case phone::MusicField::Playback:
             if (event.music.text[0] >= '0' && event.music.text[0] <= '3') {
@@ -1444,11 +2077,13 @@ void companionUiHandle(const PhoneEvent& event) {
             const float volume = strtof(event.music.text, &end);
             if (end != event.music.text && *end == '\0' && volume >= 0 && volume <= 1) {
                 musicVolumePercent = int(volume * 100 + 0.5f);
-                lv_label_set_text_fmt(musicVolume, LV_SYMBOL_VOLUME_MID " %d%%", musicVolumePercent);
+                lv_label_set_text_fmt(musicVolume, "%d%%", musicVolumePercent);
+                lv_bar_set_value(musicVolumeBar, musicVolumePercent, LV_ANIM_ON);
             }
             break;
         }
         case phone::MusicField::Player:
+            lv_label_set_text(musicPlayer, event.music.text[0] ? event.music.text : "Nhạc iPhone");
             break;
         }
         break;
@@ -1456,6 +2091,7 @@ void companionUiHandle(const PhoneEvent& event) {
         musicHint("iPhone chưa nhận lệnh");
         break;
     case PhoneEventType::Disconnected:
+        linkSecured=false;
         lv_obj_set_hidden(deleteDialog,true);
         hiddenCount=0; detailOpen=false;
         hasGoogleGuide = false;
@@ -1469,6 +2105,7 @@ void companionUiHandle(const PhoneEvent& event) {
         refreshInbox();
         clearMaps(true);
         lv_obj_set_hidden(pairingPanel, true);
+        lv_obj_set_hidden(pinPanel, true); pendingPasskeyValid = false;
         status(MUTED);
         break;
     }
@@ -1513,14 +2150,319 @@ void updateSpeedFaces(uint32_t now) {
     lv_label_set_text_fmt(speedDialValue, "%d", rounded);
 }
 
+void formatDistance(char* out, size_t size, uint32_t metres) {
+    if (metres < 1000) snprintf(out, size, "%u m", unsigned(metres < 100 ? metres : metres / 10 * 10));
+    else if (metres < 10000) snprintf(out, size, "%u,%u km", unsigned(metres / 1000), unsigned(metres % 1000 / 100));
+    else snprintf(out, size, "%u km", unsigned((metres + 500) / 1000));
+}
+
+// "12,4 km" ridden today (phone GPS), "--" when unknown or from another day.
+bool todayText(char* out, size_t size) {
+    TodayDistance today{};
+    if (!navStreamToday(today) || !clockValid) { strlcpy(out, "--", size); return false; }
+    const time_t local = time(nullptr) + utcOffset; tm d{}; gmtime_r(&local, &d);
+    const uint32_t key = uint32_t(d.tm_year + 1900) * 10000 + (d.tm_mon + 1) * 100 + d.tm_mday;
+    formatDistance(out, size, today.dayKey == key ? today.metres : 0);
+    return true;
+}
+
+// Rain line shared by the riding face and the trip-start warning.
+bool weatherText(char* out, size_t size, bool& rainy) {
+    WeatherInfo w{};
+    rainy = false;
+    if (!navStreamWeather(w)) { out[0] = 0; return false; }
+    const int temp = (w.tempTenths + (w.tempTenths >= 0 ? 5 : -5)) / 10;
+    rainy = w.rainChance >= 40 && w.rainInMinutes != 0xFFFF;
+    if (!rainy) snprintf(out, size, "%d° · Không mưa", temp);
+    else if (w.rainInMinutes < 30) snprintf(out, size, "Đang/sắp mưa %u%%", unsigned(w.rainChance));
+    else if (clockValid) {
+        const time_t at = time(nullptr) + utcOffset + w.rainInMinutes * 60; tm d{}; gmtime_r(&at, &d);
+        snprintf(out, size, "Mưa %u%% lúc %dh", unsigned(w.rainChance), d.tm_hour);
+    } else snprintf(out, size, "Mưa %u%% trong %u phút", unsigned(w.rainChance), unsigned(w.rainInMinutes));
+    return true;
+}
+
+void showRainWarning(const char* text) {
+    if (quietNotices || lv_obj_is_visible(pairingPanel)) return;
+    popupUid = 0;
+    popupUntil = millis() + 10000;
+    lv_label_set_text(popupApp, "Thời tiết");
+    char popup[160];
+    snprintf(popup, sizeof(popup), "%s\nNhớ mang áo mưa trước khi đi.", text);
+    lv_label_set_text(popupText, popup);
+    lv_obj_set_hidden(noticePopup, false);
+    wakeRequested = true;
+}
+
+void updateRideFace(uint32_t now) {
+    static uint32_t last = 0;
+    if (now - last < 250) return;
+    last = now;
+    TripInfo trip{};
+    const bool tripActive = navStreamTrip(trip) || mapTripActive;
+    // Trips always switch to the ride face; it can also be the chosen default face.
+    const bool active = tripActive || hudSettingsGet().face == RIDE_FACE;
+    if (tripActive != rideTrip) {
+        rideTrip = tripActive;
+        if (tripActive && !rainWarned) {
+            char text[64]; bool rainy = false;
+            if (weatherText(text, sizeof(text), rainy) && rainy) showRainWarning(text);
+            rainWarned = true;
+        }
+        if (!tripActive) rainWarned = false;
+    }
+    if (active != rideVisible) {
+        rideVisible = active;
+        lv_obj_set_hidden(rideFace, !active);
+        if (active) lv_obj_move_foreground(rideFace);
+        if (currentPage == 0) lv_label_set_text(pageHeading, hudLocked() ? "ĐÃ KHÓA" : active ? "ĐI XE" : "ĐỒNG HỒ");
+    }
+    if (!active) return;
+    const int tenths = navStreamSpeedTenths();
+    char text[96]; bool rainy = false;
+    if (tenths >= 0) snprintf(text, sizeof(text), "%d", (tenths + 5) / 10); else strlcpy(text, "--", sizeof(text));
+    setIfChanged(rideSpeed, text);
+    textColorIfChanged(rideSpeed, tenths > 600 ? 0xFF5A79 : WHITE);
+    weatherText(text, sizeof(text), rainy);
+    setIfChanged(rideWeather, text);
+    textColorIfChanged(rideWeather, rainy ? 0xF5B83D : MUTED);
+    bgColorIfChanged(rideArrow, tripActive ? 0x45D483 : BUTTON);
+    textColorIfChanged(rideArrowIcon, tripActive ? 0x04170C : MUTED);
+    if (!tripActive) {
+        // Default ride face without a trip: today's distance and a hint to start one.
+        setIfChanged(rideLeftTitle, "Hôm nay");
+        todayText(text, sizeof(text));
+        setIfChanged(rideLeft, text);
+        setIfChanged(rideTurn, "Chưa có chuyến đi");
+        setIfChanged(rideStreet, "Vuốt sang Bản đồ để chọn điểm đến");
+        setIfChanged(rideArrowIcon, LV_SYMBOL_GPS);
+    } else if (trip.active) {
+        formatDistance(text, sizeof(text), trip.remainingMetres);
+        setIfChanged(rideLeft, text);
+        if (trip.etaMinute < 1440) snprintf(text, sizeof(text), "Còn lại · đến %02u:%02u", unsigned(trip.etaMinute / 60), unsigned(trip.etaMinute % 60));
+        else strlcpy(text, "Còn lại", sizeof(text));
+        setIfChanged(rideLeftTitle, text);
+        if (trip.maneuver == 6 && trip.turnMetres <= 30) strlcpy(text, "Đã đến nơi", sizeof(text));
+        else formatDistance(text, sizeof(text), trip.turnMetres);
+        setIfChanged(rideTurn, text);
+        setFontSafeText(rideStreet, trip.instruction, true);
+        static const char* icons[] = {LV_SYMBOL_UP, LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT, LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT, LV_SYMBOL_REFRESH, LV_SYMBOL_GPS};
+        setIfChanged(rideArrowIcon, icons[trip.maneuver < 7 ? trip.maneuver : 0]);
+    } else {
+        setIfChanged(rideLeft, "--");
+        setIfChanged(rideLeftTitle, "Còn lại");
+        setIfChanged(rideTurn, "Đang dẫn đường");
+        if (hasGoogleGuide) setFontSafeText(rideStreet, googleGuide.message[0] ? googleGuide.message : googleGuide.title, true);
+        else setIfChanged(rideStreet, "Xem chi tiết ở trang Bản đồ");
+        setIfChanged(rideArrowIcon, LV_SYMBOL_GPS);
+    }
+}
+
+// Day/night backlight from the phone's sunrise/sunset (fallback 06:00/18:00),
+// ramped over 40 minutes so the change is never sudden.
+uint8_t autoBrightnessLevel() {
+    const uint8_t manual = hudHardwareSettingsGet().brightness;
+    if (!hudAutoBrightness() || !clockValid) return manual;
+    WeatherInfo w{};
+    int rise = 6 * 60, set = 18 * 60;
+    if (navStreamWeather(w) && w.sunriseMinute < 1440 && w.sunsetMinute < 1440 && w.sunriseMinute < w.sunsetMinute) {
+        rise = w.sunriseMinute; set = w.sunsetMinute;
+    }
+    const time_t local = time(nullptr) + utcOffset; tm d{}; gmtime_r(&local, &d);
+    const float minute = d.tm_hour * 60 + d.tm_min + d.tm_sec / 60.0f;
+    constexpr float DAY = 100, NIGHT = 30, RAMP = 40;
+    auto ramp = [&](float centre) { return std::max(0.0f, std::min(1.0f, (minute - (centre - RAMP / 2)) / RAMP)); };
+    const float day = ramp(rise) * (1 - ramp(set)); // 0 night .. 1 day
+    return uint8_t(NIGHT + (DAY - NIGHT) * day + 0.5f);
+}
+
+lv_obj_t* shade(lv_obj_t* parent, int y, int height, lv_opa_t top, lv_opa_t bottom) {
+    auto obj = box(parent, 0, y, 320, height, 0x000000);
+    lv_obj_set_style_radius(obj, 0, 0);
+    lv_obj_set_style_bg_grad_color(obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_grad_dir(obj, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_main_opa(obj, top, 0);
+    lv_obj_set_style_bg_grad_opa(obj, bottom, 0);
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    return obj;
+}
+
+void buildWallFace() {
+    wallFace = box(root, 0, 0, 320, 240, 0x16264A);
+    lv_obj_set_style_radius(wallFace, 0, 0);
+    // Default backdrop until a photo arrives: deep blue night gradient.
+    lv_obj_set_style_bg_grad_color(wallFace, lv_color_hex(0x05070C), 0);
+    lv_obj_set_style_bg_grad_dir(wallFace, LV_GRAD_DIR_VER, 0);
+    lv_obj_remove_flag(wallFace, LV_OBJ_FLAG_CLICKABLE);
+    wallImage = lv_image_create(wallFace);
+    lv_obj_set_pos(wallImage, 0, 0);
+    lv_obj_set_hidden(wallImage, true);
+    wallDim = shade(wallFace, 0, 240, 110, 110);          // even dim behind classic faces
+    wallTopShade = shade(wallFace, 0, 110, 150, 0);       // lock layout: date and status bar
+    wallBottomShade = shade(wallFace, 130, 110, 0, 190);  // lock layout: widget row
+    wallDate = label(wallFace, 0, 22, 320, "", 0xFFFFFF, textFont);
+    lv_obj_set_style_text_align(wallDate, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(wallDate, 230, 0);
+    wallClock = label(wallFace, 0, 64, 320, "--:--", 0xFFFFFF, &hud_font_clock_80);
+    lv_obj_set_style_text_align(wallClock, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(wallClock, -2, 0);
+    wallHint = label(wallFace, 0, 150, 320, "Chọn ảnh nền trong app HUD Connect", 0xFFFFFF, &hud_font_vietnamese_14);
+    lv_obj_set_style_text_align(wallHint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(wallHint, 170, 0);
+    // Glass widgets, like the iOS lock screen widget row.
+    const char* titles[] = {"Thời tiết", "Âm lịch", "Hôm nay"};
+    for (int i = 0; i < 3; ++i) {
+        auto pill = box(wallFace, 10 + i * 102, 182, 96, 48, 0xFFFFFF);
+        wallPills[i] = pill;
+        lv_obj_set_style_radius(pill, 16, 0);
+        lv_obj_set_style_bg_opa(pill, 46, 0);
+        lv_obj_set_style_border_width(pill, 1, 0);
+        lv_obj_set_style_border_color(pill, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_opa(pill, 70, 0);
+        lv_obj_remove_flag(pill, LV_OBJ_FLAG_CLICKABLE);
+        auto title = label(pill, 0, 4, 96, titles[i], 0xFFFFFF, &hud_font_vietnamese_14);
+        lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_opa(title, 180, 0);
+        wallPillValues[i] = label(pill, 4, 22, 88, "--", 0xFFFFFF, textFont);
+        lv_obj_set_style_text_align(wallPillValues[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(wallPillValues[i], LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_height(wallPillValues[i], 22);
+    }
+    lv_obj_move_to_index(wallFace, 0); // under the status bar and pages
+    lv_obj_set_hidden(wallFace, true);
+}
+
+void setIfChanged(lv_obj_t* obj, const char* text) {
+    if (strcmp(lv_label_get_text(obj), text)) lv_label_set_text(obj, text);
+}
+
+// Shading is baked into a copy of the photo (uniform dim behind classic faces, top and
+// bottom fades for the iPhone face) so each frame is a plain image copy instead of
+// alpha-blending full-screen overlays, which cost >100 ms per frame.
+const uint16_t* bakeWallpaper(int layout) {
+    static uint16_t* shaded = static_cast<uint16_t*>(heap_caps_malloc(WALL_W * WALL_H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    const uint16_t* src = wallpaperPixels();
+    if (!shaded || !src) return src;
+    for (int y = 0; y < WALL_H; ++y) {
+        int alpha = 110;                                   // classic faces: ~43% dim
+        if (layout == 2) alpha = y < 110 ? 150 * (110 - y) / 110 : y >= 130 ? 190 * (y - 130) / 110 : 0;
+        const uint32_t keep = 256 - alpha * 256 / 255;
+        const uint16_t* in = src + y * WALL_W;
+        uint16_t* out = shaded + y * WALL_W;
+        for (int x = 0; x < WALL_W; ++x) {
+            const uint32_t p = in[x];
+            out[x] = uint16_t((((p >> 11) * keep >> 8) << 11) | ((((p >> 5) & 63) * keep >> 8) << 5) | ((p & 31) * keep >> 8));
+        }
+    }
+    return shaded;
+}
+
+void setLockLayout(bool on) {
+    for (auto obj : {wallDate, wallClock, wallPills[0], wallPills[1], wallPills[2]}) lv_obj_set_hidden(obj, !on);
+    for (auto obj : {wallDim, wallTopShade, wallBottomShade}) lv_obj_set_hidden(obj, true); // baked instead
+    lv_obj_set_hidden(pageHeading, on);
+    lv_obj_set_hidden(smallClock, on);
+}
+
+void updateWallFace(uint32_t now) {
+    size_t wallBytes = 0;
+    static uint8_t* incoming = static_cast<uint8_t*>(heap_caps_malloc(48 * 1024, MALLOC_CAP_SPIRAM));
+    if (incoming && navStreamTakeWallpaper(incoming, 48 * 1024, wallBytes) && wallpaperSave(incoming, wallBytes))
+        wallpaperSetBackground(true); // a new photo means "use it"
+    // The theme palette depends on the background (dark twin over photos).
+    static bool appliedPhoto = false;
+    if (appliedPhoto != wallpaperBackground()) { appliedPhoto = wallpaperBackground(); applySettings(); }
+    // Visibility follows page swipes immediately; widget text refreshes 4x/s.
+    const bool photo = wallpaperBackground();
+    const bool lock = currentPage == 0 && hudSettingsGet().face == PHONE_FACE && !rideVisible;
+    const bool active = lock || (photo && currentPage == 0);
+    const int state = !active ? 0 : lock ? 2 : 1;
+    if (state != wallState) {
+        wallState = state;
+        lv_obj_set_hidden(wallFace, !active);
+        lv_obj_set_style_bg_opa(pages[0], active ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+        // Ride face: see-through panel and a glass card over the photo.
+        lv_obj_set_style_bg_opa(rideFace, active ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(rideCard, active ? 70 : LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(rideCard, active ? 1 : 0, 0);
+        lv_obj_set_style_border_color(rideCard, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_opa(rideCard, 80, 0);
+        // Analog dials sit on a translucent disc instead of a solid one.
+        lv_obj_set_style_bg_opa(analog, active ? 120 : LV_OPA_COVER, 0);
+        setLockLayout(state == 2);
+        if (state != 2) { lv_obj_set_hidden(pageHeading, false); lv_obj_set_hidden(smallClock, false); }
+        wallShownRevision = 0; // refresh image/colour below
+        lv_obj_set_style_bg_color(wallFace, lv_color_hex(BG), 0); // colour background: theme (dark twin)
+    }
+    const bool active2 = active;
+    (void)active2;
+    if (!active) return;
+    static uint32_t last = 0;
+    if (now - last < 250 && wallShownRevision == wallpaperRevision()) return;
+    last = now;
+    if (wallShownRevision != wallpaperRevision()) {
+        wallShownRevision = wallpaperRevision();
+        const bool has = wallpaperHas();
+        if (has) {
+            lv_image_cache_drop(&wallDsc);
+            wallDsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+            wallDsc.header.cf = LV_COLOR_FORMAT_RGB565;
+            wallDsc.header.w = WALL_W; wallDsc.header.h = WALL_H;
+            wallDsc.header.stride = WALL_W * 2;
+            wallDsc.data = reinterpret_cast<const uint8_t*>(bakeWallpaper(wallState));
+            wallDsc.data_size = WALL_W * WALL_H * 2;
+            lv_image_set_src(wallImage, &wallDsc);
+            lv_obj_invalidate(wallImage);
+        }
+        lv_obj_set_hidden(wallImage, !has || !photo);
+        lv_obj_set_hidden(wallHint, has || !photo || wallState != 2);
+        lv_obj_set_style_text_color(wallClock, lv_color_hex(wallpaperColor()), 0);
+    }
+    char text[48]; bool rainy = false;
+    WeatherInfo w{};
+    if (navStreamWeather(w)) {
+        weatherText(text, sizeof(text), rainy);
+        if (rainy) snprintf(text, sizeof(text), "Mưa %u%%", unsigned(w.rainChance));
+        else snprintf(text, sizeof(text), "%d°", (w.tempTenths + (w.tempTenths >= 0 ? 5 : -5)) / 10);
+    } else strlcpy(text, "--", sizeof(text));
+    setIfChanged(wallPillValues[0], text);
+    textColorIfChanged(wallPillValues[0], rainy ? 0xFFC861 : 0xFFFFFF);
+    todayText(text, sizeof(text));
+    setIfChanged(wallPillValues[2], text);
+}
+
+void updateBatteryLabel(uint32_t now) {
+    batteryTick(now);
+    static int lastKey=-2;
+    const BatteryStatus b=batteryRead();
+    const int key=b.present ? b.percent*2+(b.charging?1:0) : -1;
+    if(key==lastKey || !batteryLabel) return;
+    lastKey=key;
+    if(!b.present) { lv_label_set_text(batteryLabel,""); return; }
+    lv_label_set_text_fmt(batteryLabel,"%s%d%%",b.charging ? LV_SYMBOL_CHARGE : "",b.percent);
+    lv_obj_set_style_text_color(batteryLabel,lv_color_hex(b.charging ? 0x69E4AA : b.percent<=15 ? 0xFF5A79 : WHITE),0);
+}
+
 void companionUiTick() {
     const uint32_t now = millis();
+    updateBatteryLabel(now);
+    applyPendingQuickSettings();
+    static uint32_t qsRevision=0;
+    if(qsPanel && !lv_obj_is_hidden(qsPanel) && qsRevision!=hudSettingsRevision()) { qsRevision=hudSettingsRevision(); refreshQuickSettings(); }
     applyPendingAiGesture();
     AiToolRequest tool{};
     if(aiVoicePollTool(tool)) executeAiTool(tool);
     aiVoiceToolTick();
     static AiVoiceView aiView{};
     aiVoiceRead(aiView);
+    aiRecordingNow=aiView.recording;
+    if(strncmp(heardQuestion,aiView.question,sizeof(heardQuestion)-1)!=0) {
+        // Bounded copy that never splits a UTF-8 sequence.
+        size_t n=strnlen(aiView.question,sizeof(heardQuestion)-1);
+        while(n && n<strlen(aiView.question) && (uint8_t(aiView.question[n])&0xC0)==0x80) --n;
+        memcpy(heardQuestion,aiView.question,n); heardQuestion[n]=0;
+        if(mapSearchPanel && !lv_obj_is_hidden(mapSearchPanel)) mapSearchRevision=UINT32_MAX;
+    }
     if(aiHolding) hidePopup();
     if(aiStatus && aiRevision!=aiView.revision) {
         aiRevision=aiView.revision;
@@ -1544,19 +2486,20 @@ void companionUiTick() {
         for (size_t i = 0; i < count; ++i) if (notices[i].uid == popupUid) popupStillAllowed = true;
         if (!popupStillAllowed) hidePopup();
     }
-    const uint8_t* jpeg = nullptr;
-    size_t jpegSize = 0;
-    if (navStreamTake(jpeg, jpegSize) && !jpeg) { mapTripActive=false; clearMaps(true); }
-    else if (jpegSize && jpeg) {
+    const int decodeState=mapDecodeState.load(std::memory_order_acquire);
+    if (decodeState==MAP_DONE) {
+        mapDecodeState.store(MAP_IDLE,std::memory_order_relaxed);
+        if(mapDecodeMs>=150) Serial.printf("Map decode: %ums\n",unsigned(mapDecodeMs));
         if (!mapLive && currentPage!=AI_PAGE) showPage(2);
         lv_image_cache_drop(&mapFrame);
         mapFrame = {};
         mapFrame.header.magic = LV_IMAGE_HEADER_MAGIC;
-        mapFrame.header.cf = LV_COLOR_FORMAT_RAW;
-        mapFrame.header.w = 300;
-        mapFrame.header.h = 200;
-        mapFrame.data = jpeg;
-        mapFrame.data_size = jpegSize;
+        mapFrame.header.cf = LV_COLOR_FORMAT_RGB565;
+        mapFrame.header.w = MAP_W;
+        mapFrame.header.h = MAP_H;
+        mapFrame.header.stride = MAP_W*2;
+        mapFrame.data = reinterpret_cast<const uint8_t*>(mapPixels[mapPixelTarget]);
+        mapFrame.data_size = MAP_W*MAP_H*2;
         lv_image_set_src(mapImage, &mapFrame);
         lv_obj_set_hidden(mapImage, false);
         lv_obj_set_hidden(mapControls, false);
@@ -1565,6 +2508,15 @@ void companionUiTick() {
         lv_obj_set_hidden(mapSource,true); lv_obj_set_hidden(lv_obj_get_parent(mapTitle),true);
         lv_obj_set_hidden(mapPortraitHint,viewHeight<=viewWidth);
         mapReceivedAt = now;
+    } else if (decodeState==MAP_FAILED) {
+        mapDecodeState.store(MAP_IDLE,std::memory_order_relaxed);
+    }
+    // Take a new JPEG only while the worker is idle: it still reads the old one.
+    if (mapDecodeState.load(std::memory_order_acquire)==MAP_IDLE) {
+        const uint8_t* jpeg = nullptr;
+        size_t jpegSize = 0;
+        if (navStreamTake(jpeg, jpegSize) && !jpeg) { mapTripActive=false; clearMaps(true); }
+        else if (jpegSize && jpeg) startMapDecode(jpeg,jpegSize);
     }
     if (mapLive && now - mapReceivedAt > 15000) {
         clearMaps(true);
@@ -1593,7 +2545,10 @@ void companionUiTick() {
     }
     refreshMapSearch();
     updateMapChrome(now);
-    updateSpeedFaces(now);
+    updateRideFace(now);
+    updateLock(now);
+    updateInfoPanel(now);
+    updateWallFace(now);
     static uint32_t lastSpeedSecond=UINT32_MAX;
     if(lastSpeedSecond!=now/1000) {
         lastSpeedSecond=now/1000;
@@ -1623,34 +2578,44 @@ void companionUiTick() {
     const time_t local = utc + utcOffset;
     tm date{};
     gmtime_r(&local, &date);
-    const float angles[] = {(date.tm_hour % 12 + date.tm_min / 60.0f) * 3.14159265f / 6,
-        (date.tm_min + date.tm_sec / 60.0f) * 3.14159265f / 30, date.tm_sec * 3.14159265f / 30};
-    const int lengths[] = {35, 52, 58};
-    for (int i = 0; i < 3; ++i) {
-        handPoints[i][0] = {72, 72};
-        handPoints[i][1] = {72 + int(lengths[i] * sinf(angles[i])), 72 - int(lengths[i] * cosf(angles[i]))};
-        lv_line_set_points(hands[i], handPoints[i], 2);
+    // Hands move every second, so only touch them while the dial is on screen.
+    if (currentPage == 0 && !lv_obj_is_hidden(analog)) {
+        const float angles[] = {(date.tm_hour % 12 + date.tm_min / 60.0f) * 3.14159265f / 6,
+            (date.tm_min + date.tm_sec / 60.0f) * 3.14159265f / 30, date.tm_sec * 3.14159265f / 30};
+        const int lengths[] = {35, 52, 58};
+        for (int i = 0; i < 3; ++i) {
+            handPoints[i][0] = {72, 72};
+            handPoints[i][1] = {72 + int(lengths[i] * sinf(angles[i])), 72 - int(lengths[i] * cosf(angles[i]))};
+            lv_line_set_points(hands[i], handPoints[i], 2);
+        }
     }
-    lv_label_set_text_fmt(clockLabel, "%02d:%02d", date.tm_hour, date.tm_min);
-    lv_label_set_text_fmt(smallClock, "%02d:%02d",date.tm_hour,date.tm_min);
-    lv_label_set_text_fmt(speedDigitalClock, "%02d:%02d", date.tm_hour, date.tm_min);
-    lv_label_set_text_fmt(speedDialClock, "%02d:%02d", date.tm_hour, date.tm_min);
+    // Labels change once a minute; writing them every second forced needless redraws.
+    char hm[8], text[96];
+    snprintf(hm, sizeof(hm), "%02d:%02d", date.tm_hour, date.tm_min);
+    for (auto obj : {clockLabel, smallClock, rideClock, wallClock}) setIfChanged(obj, hm);
     const char* days[] = {"Chủ nhật", "Thứ hai", "Thứ ba", "Thứ tư", "Thứ năm", "Thứ sáu", "Thứ bảy"};
-    char text[96];
     snprintf(text, sizeof(text), "%s, %02d/%02d/%04d", days[date.tm_wday],
              date.tm_mday, date.tm_mon + 1, date.tm_year + 1900);
-    lv_label_set_text(dateLabel, text);
-    lv_label_set_text(speedDigitalDate, text);
-    lv_label_set_text_fmt(extraLabel, "%02d", hudSettingsGet().face == 4 ? date.tm_mday : date.tm_sec);
+    setIfChanged(dateLabel, text);
+    snprintf(text, sizeof(text), "%s, %02d/%02d", days[date.tm_wday], date.tm_mday, date.tm_mon + 1);
+    setIfChanged(rideDate, text);
+    snprintf(text, sizeof(text), "%s, %d tháng %d", days[date.tm_wday], date.tm_mday, date.tm_mon + 1);
+    setIfChanged(wallDate, text);
     static int lunarDateKey=-1;
     const time_t vietnamTime=utc+7*3600; tm vietnamDate{}; gmtime_r(&vietnamTime,&vietnamDate);
     const int dayKey=(vietnamDate.tm_year+1900)*10000+(vietnamDate.tm_mon+1)*100+vietnamDate.tm_mday;
     if(lunarDateKey!=dayKey) {
         lunarDateKey=dayKey;
         const auto value=lunar::vietnamese(vietnamDate.tm_mday,vietnamDate.tm_mon+1,vietnamDate.tm_year+1900);
-        if(value.day) lv_label_set_text_fmt(lunarLabel,"Âm lịch: %02d/%02d%s",value.day,value.month,value.leap ? " nhuận" : "");
-        else lv_label_set_text(lunarLabel,"Âm lịch: --/--");
+        if(value.day) snprintf(lunarText,sizeof(lunarText),"Âm %02d/%02d%s",value.day,value.month,value.leap ? " nhuận" : "");
+        if(value.day) lv_label_set_text_fmt(wallPillValues[1],"%d/%d%s",value.day,value.month,value.leap ? " N" : "");
+        else strlcpy(lunarText,"Âm --/--",sizeof(lunarText));
     }
+    // Bottom line of the classic faces: lunar date and today's distance.
+    char km[16], line[64];
+    if(todayText(km,sizeof(km))) snprintf(line,sizeof(line),"%s  ·  Hôm nay %s",lunarText,km);
+    else strlcpy(line,lunarText,sizeof(line));
+    setIfChanged(lunarLabel,line);
 }
 
 void companionUiBluetoothFailed() {
@@ -1658,9 +2623,13 @@ void companionUiBluetoothFailed() {
     lv_label_set_text(dateLabel, "Không khởi tạo được Bluetooth");
 }
 
-bool companionUiNavigationActive() { return mapLive && currentPage == 2; }
+bool companionUiNavigationActive() { return (mapLive && currentPage == 2) || (rideTrip && currentPage == 0); }
+uint8_t companionUiBrightness() { return autoBrightnessLevel(); }
+
+bool companionUiConsumeWakeRequest() { const bool r=wakeRequested; wakeRequested=false; return r; }
 
 void companionUiPrintStatus() {
+    { const BatteryStatus b=batteryRead(); Serial.printf("Battery: present=%d; mv=%d; pct=%d; charging=%d\n",b.present,b.millivolts,b.percent,b.charging); }
     Serial.printf("Destination UI: phase=%u; panel=%u; start=%u; page=%d\n",unsigned(mapSearchState.phase),
         mapSearchPanel && lv_obj_is_visible(mapSearchPanel),mapSearchStart && lv_obj_is_visible(mapSearchStart),currentPage);
     lv_mem_monitor_t memory{}; lv_mem_monitor(&memory);

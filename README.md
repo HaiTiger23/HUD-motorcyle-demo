@@ -8,8 +8,8 @@ Trang chủ dùng giờ chữ đậm 80 px, ngày tháng tiếng Việt chữ đ
 Màn hình mặc định tắt đèn nền sau **30 giây không chạm**; có thể đổi trong app
 HUD Connect thành 15/30/60/120/300 giây hoặc luôn sáng. Chạm một lần để bật lại;
 lần chạm đánh thức không kích hoạt nút bên dưới, chạm tiếp để thao tác bình thường.
-Bluetooth, cảm ứng và cập nhật nội dung vẫn chạy khi tắt đèn nền. Thông báo mới
-không tự bật màn hình. Nếu không phát hiện được cảm ứng lúc khởi động, firmware
+Bluetooth, cảm ứng và cập nhật nội dung vẫn chạy khi tắt đèn nền. Thông báo mới (không tính tin cũ iPhone gửi lại khi kết nối)
+tự bật đèn nền và đếm lại thời gian chờ; tin bị bộ lọc app chặn thì không bật. Nếu không phát hiện được cảm ứng lúc khởi động, firmware
 giữ màn hình sáng để tránh tắt rồi không đánh thức được.
 
 | Trang | Chức năng và giới hạn |

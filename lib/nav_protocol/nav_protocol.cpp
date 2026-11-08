@@ -15,7 +15,7 @@ uint32_t crc32(const uint8_t* data, size_t size) {
     }
     return ~crc;
 }
-bool validDimensions(const uint8_t* p, size_t size) {
+bool validDimensions(const uint8_t* p, size_t size, uint16_t width, uint16_t height) {
     if (size < 4 || p[0] != 0xff || p[1] != 0xd8) return false;
     size_t i = 2;
     while (i + 4 <= size) {
@@ -29,8 +29,8 @@ bool validDimensions(const uint8_t* p, size_t size) {
         if (length < 2 || length > size - i) return false;
         if (marker == 0xc0) {
             return length >= 8 && p[i + 2] == 8 &&
-                (uint16_t(p[i + 3]) * 256 + p[i + 4]) == HEIGHT &&
-                (uint16_t(p[i + 5]) * 256 + p[i + 6]) == WIDTH &&
+                (uint16_t(p[i + 3]) * 256 + p[i + 4]) == height &&
+                (uint16_t(p[i + 5]) * 256 + p[i + 6]) == width &&
                 (p[i + 7] == 1 || p[i + 7] == 3);
         }
         if (marker >= 0xc1 && marker <= 0xc3) return false; // baseline JPEG only
@@ -59,7 +59,7 @@ Result Receiver::feed(const uint8_t* p, size_t size) {
     }
     if (p[0] == 3 && size == 5) {
         active_ = false;
-        if (received_ == total_ && crc32(buffer_, total_) == checksum_ && validDimensions(buffer_, total_))
+        if (received_ == total_ && crc32(buffer_, total_) == checksum_ && validDimensions(buffer_, total_, width_, height_))
             return Result::Complete;
     }
     reset();

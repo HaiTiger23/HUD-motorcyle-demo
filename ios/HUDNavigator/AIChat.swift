@@ -25,6 +25,7 @@ private enum RouterKey {
         item[kSecAttrAccessible as String]=kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         return SecItemAdd(item as CFDictionary,nil)==errSecSuccess
     }
+    static func delete(_ endpoint: String) { SecItemDelete(query(endpoint) as CFDictionary) }
 }
 // Do not forward authorization or question bodies across redirects.
 private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
@@ -44,9 +45,23 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     @Published var systemPrompt=AIChatModel.storedPrompt()
     private var appliedPrompt=AIChatModel.storedPrompt()
     @Published var endpoint=UserDefaults.standard.string(forKey:"hudRouterEndpoint") ?? "https://api.proxy1990.id.vn/v1"
-    @Published var model=UserDefaults.standard.string(forKey:"hudRouterModel") ?? ""
+    /// "router" (9router / any OpenAI-compatible API) or "gemini" (Google AI Studio key).
+    @Published var provider=UserDefaults.standard.string(forKey:"hudAIProvider") ?? "gemini"
+    static let geminiEndpoint="https://generativelanguage.googleapis.com/v1beta/openai"
+    static let geminiDefaultModel="gemini-3.5-flash-lite"
+    /// One-time switch of the saved Gemini model to 3.5 Flash-Lite (user request, Nov 2026).
+    private static let modelMigration: Void={
+        guard !UserDefaults.standard.bool(forKey:"hudGeminiModel35") else { return }
+        UserDefaults.standard.set(true,forKey:"hudGeminiModel35")
+        UserDefaults.standard.set("gemini-3.5-flash-lite",forKey:"hudGeminiModel")
+    }()
+    var isGemini: Bool { provider=="gemini" }
+    var providerName: String { isGemini ? "Gemini" : "9router" }
+    private static func modelKey(_ provider: String) -> String { provider=="gemini" ? "hudGeminiModel" : "hudRouterModel" }
+    @Published var model={ AIChatModel.modelMigration; return UserDefaults.standard.string(forKey:AIChatModel.modelKey(UserDefaults.standard.string(forKey:"hudAIProvider") ?? "gemini"))
+        ?? ((UserDefaults.standard.string(forKey:"hudAIProvider") ?? "gemini")=="gemini" ? AIChatModel.geminiDefaultModel : "") }()
     @Published var models: [String]=[]
-    @Published var status="Cài đặt 9router rồi giữ nút nói trên HUD"
+    @Published var status="Cài đặt AI rồi giữ nút nói trên HUD"
     @Published var question=""
     @Published var answer=""
     @Published var busy=false
@@ -106,6 +121,8 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     private var sampleCount=0
     private var ended=false
     private var transcriptSubmitted=false
+    private var liveSentAt=Date.distantPast
+    private var liveSentText=""
     private var history: [[String:String]]=[]
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var backgroundGeneration=0
@@ -120,7 +137,7 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     Lệnh không có value: music_play, music_pause, music_next, music_previous, volume_up, volume_down (âm lượng một bước, không đặt phần trăm), music_status.
     Thông báo HUD đã nhận: notifications_count (đếm), notifications_latest (đọc mới nhất), notifications_list (liệt kê ba mục mới nhất), notifications_summary (tóm tắt ba mục mới nhất). Không có dữ liệu toàn bộ iPhone hay trạng thái đã đọc/chưa đọc. App có thể tự đọc câu trả lời qua loa HUD nếu người dùng bật giọng đọc.
     Lệnh có value: set_theme=0 Đại dương/tối xanh,1 Rừng xanh,2 Hoàng hôn,3 Anh đào,4 Trắng xanh/nền sáng,5 Bạc hà,6 Kem,7 Hồng sáng.
-    set_face=0 Rõ nét,1 Sắc màu,2 Kim hiện đại,3 Có giây,4 Ngày lớn,5 Kim cổ điển,6 Tốc độ số,7 Tốc độ kim.
+    set_face=0 Số lớn,2 Kim hiện đại,5 Kim cổ điển,6 Đi xe (tốc độ),8 iPhone (toàn màn hình).
     set_timeout=15,30,60,120,300 giây hoặc 0 luôn sáng. Không dùng 0 để tắt màn hình.
     show_page=0 Đồng hồ,1 Thông báo,2 Bản đồ,3 Nhạc. Đây chỉ mở trang, không bắt đầu tuyến đường.
     Khi người dùng muốn tìm/chỉ đường đến một địa điểm cụ thể, trả {"action":"navigate_to","query":"tên địa điểm"}. Chỉ dùng tên/loại địa điểm trong câu nói; MapKit sẽ tìm kết quả thật và HUD luôn yêu cầu người dùng chọn, xem tuyến, rồi bấm bắt đầu.
@@ -165,7 +182,25 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     private func finishBackgroundIfIdle() {
         if !busy && !speaking && !bluetooth.voicePending { endBackgroundWork() }
     }
-    var hasKey: Bool { !RouterKey.read(endpoint.trimmingCharacters(in:.whitespacesAndNewlines)).isEmpty }
+    var hasKey: Bool { !RouterKey.read((try? baseURL().absoluteString) ?? "").isEmpty }
+    /// "••••abcd" for the saved key of the current provider, empty when none.
+    var savedKeyHint: String {
+        let key=RouterKey.read((try? baseURL().absoluteString) ?? "")
+        return key.isEmpty ? "" : "••••"+String(key.suffix(4))
+    }
+    func clearKey() {
+        if let base=try? baseURL().absoluteString { RouterKey.delete(base) }
+        status="Đã xóa API key \(providerName)"
+    }
+    /// Switches provider; each keeps its own key (Keychain, per endpoint) and model.
+    func selectProvider(_ value: String) {
+        guard value != provider else { return }
+        UserDefaults.standard.set(model.trimmingCharacters(in:.whitespacesAndNewlines),forKey:Self.modelKey(provider))
+        provider=value; UserDefaults.standard.set(value,forKey:"hudAIProvider")
+        model=UserDefaults.standard.string(forKey:Self.modelKey(value)) ?? (value=="gemini" ? Self.geminiDefaultModel : "")
+        models=[]; history=[]
+        status=hasKey ? "Đang dùng \(providerName)" : "Nhập API key của \(providerName)"
+    }
     func savePrompt() {
         let trimmed=systemPrompt.trimmingCharacters(in:.whitespacesAndNewlines)
         let value=trimmed.isEmpty ? Self.defaultPrompt : trimmed
@@ -175,6 +210,7 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
         status="Đã lưu prompt, áp dụng từ câu hỏi tiếp theo"
     }
     private func baseURL() throws -> URL {
+        if isGemini { return URL(string:Self.geminiEndpoint)! }
         let value=endpoint.trimmingCharacters(in:.whitespacesAndNewlines).trimmingCharacters(in:CharacterSet(charactersIn:"/"))
         guard let url=URL(string:value),url.scheme=="https",url.host != nil,url.user==nil,url.password==nil,
               url.query==nil,url.fragment==nil else { throw error("Nhập địa chỉ HTTPS của API, thường kết thúc bằng /v1") }
@@ -183,14 +219,14 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     private func error(_ message: String) -> NSError { NSError(domain:"HUD AI",code:1,userInfo:[NSLocalizedDescriptionKey:message]) }
     func save(key: String) {
         do {
-            endpoint=try baseURL().absoluteString
-            if !key.isEmpty && !RouterKey.save(key.trimmingCharacters(in:.whitespacesAndNewlines),endpoint:endpoint) {
+            let base=try baseURL().absoluteString
+            if !isGemini { endpoint=base; UserDefaults.standard.set(endpoint,forKey:"hudRouterEndpoint") }
+            if !key.isEmpty && !RouterKey.save(key.trimmingCharacters(in:.whitespacesAndNewlines),endpoint:base) {
                 throw error("Không lưu được khóa vào Keychain")
             }
-            UserDefaults.standard.set(endpoint,forKey:"hudRouterEndpoint")
             model=model.trimmingCharacters(in:.whitespacesAndNewlines)
-            UserDefaults.standard.set(model,forKey:"hudRouterModel")
-            status=hasKey ? "Đã lưu cài đặt 9router" : "Nhập API key của 9router"
+            UserDefaults.standard.set(model,forKey:Self.modelKey(provider))
+            status=hasKey ? "Đã lưu cài đặt \(providerName)" : "Nhập API key của \(providerName)"
         } catch { status=error.localizedDescription }
     }
     private func request(path: String, body: [String:Any]? = nil) async throws -> [String:Any] {
@@ -198,37 +234,105 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
         let key=RouterKey.read(try baseURL().absoluteString)
         guard !key.isEmpty else { throw error("Nhập API key trong tab AI của iPhone") }
         let config=URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest=40; config.timeoutIntervalForResource=50
+        // Gemma on the free Gemini API often needs 30-60 s for a full reply.
+        let slow=isGemini && model.lowercased().hasPrefix("gemma")
+        config.timeoutIntervalForRequest=slow ? 100 : 40; config.timeoutIntervalForResource=slow ? 110 : 50
         config.httpShouldSetCookies=false
         let client=URLSession(configuration:config,delegate:RouterRedirectGuard(),delegateQueue:nil)
         defer { client.invalidateAndCancel() }
         var request=URLRequest(url:url)
         request.setValue("Bearer \(key)",forHTTPHeaderField:"Authorization")
         request.setValue("application/json",forHTTPHeaderField:"Accept")
-        if let body {
+        if var body {
+            let modelName=(body["model"] as? String ?? "").lowercased()
+            if isGemini, body["max_tokens"] != nil {
+                // Gemini 2.5+ "thinks" before answering and those tokens count toward
+                // max_tokens; keep thinking short and leave room for the reply.
+                if modelName.hasPrefix("gemini") { body["max_tokens"]=4096; body["reasoning_effort"]="low" }
+                else { body["max_tokens"]=1024 } // Gemma: no thinking budget to cover; cap rambling
+            }
+            if isGemini, modelName.hasPrefix("gemma"), path=="chat/completions" {
+                // Gemma returned HTTP 500 on the OpenAI-compatible endpoint: use the native API.
+                return try await nativeGemma(body:body,key:key,client:client)
+            }
             request.httpMethod="POST"; request.setValue("application/json",forHTTPHeaderField:"Content-Type")
             request.httpBody=try JSONSerialization.data(withJSONObject:body)
         }
         let (bytes,response)=try await client.bytes(for:request)
         guard let http=response as? HTTPURLResponse else { throw error("Phản hồi API không hợp lệ") }
-        guard (200..<300).contains(http.statusCode) else {
-            throw error("9router trả HTTP \(http.statusCode). Kiểm tra địa chỉ, key và quyền model.")
-        }
+        return try await readJSON(bytes,http)
+    }
+    private func readJSON(_ bytes: URLSession.AsyncBytes, _ http: HTTPURLResponse) async throws -> [String:Any] {
         var data=Data()
         for try await byte in bytes {
             try Task.checkCancellation()
             guard data.count<262144 else { throw error("Phản hồi quá lớn") }
             data.append(byte)
         }
+        guard (200..<300).contains(http.statusCode) else {
+            // Both OpenAI-style and Google errors carry {"error":{"message":…}} (Google sometimes in an array).
+            let parsed=try? JSONSerialization.jsonObject(with:data)
+            let object=(parsed as? [String:Any]) ?? (parsed as? [[String:Any]])?.first
+            let detail=((object?["error"] as? [String:Any])?["message"] as? String).map { String($0.prefix(160)) } ?? ""
+            HUDDiagnostics.record("HUD AI HTTP \(http.statusCode): \(detail)")
+            let who=isGemini ? "Gemini" : "9router"
+            throw error("\(who) trả HTTP \(http.statusCode)"+(detail.isEmpty ? (isGemini ? ". Kiểm tra API key và tên model." : ". Kiểm tra địa chỉ, key và quyền model.") : ": \(detail)"))
+        }
         guard let object=try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw error("API chưa trả dữ liệu chat hợp lệ") }
         return object
+    }
+    /// Gemma via generateContent; the reply is reshaped like an OpenAI chat completion.
+    private func nativeGemma(body: [String:Any], key: String, client: URLSession) async throws -> [String:Any] {
+        let name=(body["model"] as? String ?? model).trimmingCharacters(in:.whitespacesAndNewlines)
+        guard name.allSatisfy({ $0.isLetter || $0.isNumber || $0=="-" || $0=="." || $0=="_" }),
+              let url=URL(string:"https://generativelanguage.googleapis.com/v1beta/models/\(name):generateContent") else {
+            throw error("Tên model Gemma không hợp lệ")
+        }
+        let messages=body["messages"] as? [[String:String]] ?? []
+        // Gemma has no system role here: fold system text into the first user turn,
+        // and merge consecutive turns of the same role (the API wants them alternating).
+        let system=messages.filter { $0["role"]=="system" }.compactMap { $0["content"] }.joined(separator:"\n\n")
+        var contents: [[String:Any]]=[]
+        for message in messages where message["role"] != "system" {
+            let role=message["role"]=="assistant" ? "model" : "user"
+            var text=message["content"] ?? ""
+            if contents.isEmpty && !system.isEmpty { text="Hướng dẫn hệ thống:\n"+system+"\n\n"+text }
+            if let last=contents.last, last["role"] as? String==role,
+               let parts=last["parts"] as? [[String:String]], let previous=parts.first?["text"] {
+                contents[contents.count-1]["parts"]=[["text":previous+"\n\n"+text]]
+            } else { contents.append(["role":role,"parts":[["text":text]]]) }
+        }
+        var request=URLRequest(url:url)
+        request.httpMethod="POST"
+        request.setValue(key,forHTTPHeaderField:"x-goog-api-key")
+        request.setValue("application/json",forHTTPHeaderField:"Content-Type")
+        request.httpBody=try JSONSerialization.data(withJSONObject:["contents":contents,
+            "generationConfig":["maxOutputTokens":1024,"temperature":0.7]])
+        let (bytes,response)=try await client.bytes(for:request)
+        guard let http=response as? HTTPURLResponse else { throw error("Phản hồi API không hợp lệ") }
+        let result=try await readJSON(bytes,http)
+        let candidate=(result["candidates"] as? [[String:Any]])?.first
+        let parts=(candidate?["content"] as? [String:Any])?["parts"] as? [[String:Any]] ?? []
+        let text=parts.filter { ($0["thought"] as? Bool) != true }.compactMap { $0["text"] as? String }.joined()
+        if text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
+            let reason=candidate?["finishReason"] as? String ?? ((result["promptFeedback"] as? [String:Any])?["blockReason"] as? String ?? "không rõ")
+            HUDDiagnostics.record("HUD AI Gemma empty: reason=\(reason)")
+            throw error("Gemma không trả lời (\(reason)). Thử lại hoặc chọn model khác.")
+        }
+        return ["choices":[["message":["role":"assistant","content":text]]]]
     }
     func loadModels() async {
         guard !loadingModels else { return }
         loadingModels=true; defer { loadingModels=false }
         do {
             let result=try await request(path:"models")
-            models=Array(Set((result["data"] as? [[String:Any]] ?? []).compactMap { $0["id"] as? String })).sorted()
+            var ids=(result["data"] as? [[String:Any]] ?? []).compactMap { $0["id"] as? String }
+            if isGemini { // "models/gemini-2.5-flash" -> chat models only, without the prefix
+                ids=ids.map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
+                    .filter { ($0.hasPrefix("gemini") || $0.hasPrefix("gemma")) && !$0.contains("embedding") && !$0.contains("tts") && !$0.contains("image") && !$0.contains("live") }
+            }
+            models=Array(Set(ids)).sorted()
+            if !model.isEmpty && !models.contains(model) { models.append(model); models.sort() }
             status=models.isEmpty ? "API không trả danh sách model. Có thể nhập tên thủ công." : "Chọn model để bắt đầu"
         } catch { status=error.localizedDescription }
     }
@@ -272,6 +376,7 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     }
     func cancel() { cancelLocal(); phase(0); status="Đã hủy câu hỏi" }
     private func fail(_ message: String) {
+        HUDDiagnostics.record("HUD AI failed: provider=\(provider); model=\(model); error=\(message)")
         cancelLocal(finishBackground:false)
         if session != 0 && !question.isEmpty { bluetooth.sendVoiceText(HUDVoiceWire.bounded(question,bytes:4095),session:session,field:1) }
         publishStatus(message); phase(4)
@@ -300,7 +405,7 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
             cancelLocal(); session=id; busy=true; bluetooth.voiceActive=true
             voicePurpose=data.count==9 ? data[8] : 0
             HUDDiagnostics.record("HUD speech session: purpose=\(voicePurpose); appState=\(UIApplication.shared.applicationState.rawValue)")
-            expectedSequence=0; sampleCount=0; ended=false; transcriptSubmitted=false; question=""; answer=""
+            expectedSequence=0; sampleCount=0; ended=false; transcriptSubmitted=false; liveSentText=""; liveSentAt = .distantPast; question=""; answer=""
             nextSegment=0; nextCommit=0; committedText=""
             guard beginBackgroundWork() else { return }
             let token=generation
@@ -433,6 +538,12 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
         }
         question=([committedText]+segments.keys.sorted().compactMap { segments[$0]?.text })
             .filter { !$0.isEmpty }.joined(separator:" ")
+        // Show the words on the HUD while the user is still speaking (throttled).
+        if session != 0, !transcriptSubmitted, !question.isEmpty, question != liveSentText,
+           Date().timeIntervalSince(liveSentAt) > 0.4 {
+            liveSentText=question; liveSentAt=Date()
+            bluetooth.sendVoiceText(HUDVoiceWire.bounded(question,bytes:4095),session:session,field:1)
+        }
     }
     private func finishTranscriptIfReady() {
         if ended && segments.isEmpty && pendingAudio.isEmpty && !rolling && !transcriptSubmitted { completeTranscript(committedText) }
@@ -464,7 +575,7 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     }
     private func ask(_ text: String, token: Int) async {
         guard !model.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { fail("Chọn model trong tab AI trên iPhone"); return }
-        publishStatus("AI đang trả lời…"); phase(2)
+        publishStatus(isGemini && model.lowercased().hasPrefix("gemma") ? "Gemma đang trả lời (có thể mất 30–60 giây)…" : "AI đang trả lời…"); phase(2)
         HUDDiagnostics.record("HUD AI chat: request")
         do {
             let instructions=Self.deviceContext+"\n\nHướng dẫn trả lời do người dùng tùy chỉnh:\n"+appliedPrompt+"\n\n"+Self.actionInstructions
@@ -759,100 +870,180 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/// Chat first: conversation + one input bar. Everything else lives behind the gear,
+/// and every setting saves itself.
 @MainActor struct AIChatView: View {
     @ObservedObject var ai: AIChatModel
     @ObservedObject var bluetooth: BluetoothLink
-    @State private var key=""
     @State private var typed=""
+    @State private var showingSettings=false
+    @FocusState private var inputFocused: Bool
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment:.leading,spacing:14) {
+                    HStack(spacing:8) {
+                        Circle().fill(bluetooth.voiceReady ? Color.green : Color.orange).frame(width:8,height:8)
+                        Text(bluetooth.voiceReady ? "Mic HUD sẵn sàng" : "Đang chờ HUD").font(.footnote.weight(.semibold))
+                        Spacer()
+                        if ai.speaking { Button("Dừng đọc",systemImage:"stop.fill",role:.destructive) { ai.stopSpeaking() }.font(.footnote) }
+                    }
+                    if !ai.permissionReady {
+                        Button("Cho phép nhận dạng giọng nói",systemImage:"mic") { Task { _=await ai.authorize() } }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    if ai.question.isEmpty && ai.answer.isEmpty {
+                        VStack(alignment:.leading,spacing:10) {
+                            Text("Vuốt từ cạnh dưới HUD lên, giữ để nói, thả để gửi.").font(.subheadline)
+                            ForEach(["Dừng nhạc","Tóm tắt thông báo","Đổi nền sáng"],id:\.self) { sample in
+                                Button { typed=sample; inputFocused=true } label: {
+                                    Text("“\(sample)”").font(.subheadline).padding(.horizontal,12).padding(.vertical,8)
+                                        .background(Color(.tertiarySystemFill),in:Capsule())
+                                }.buttonStyle(.plain)
+                            }
+                        }.foregroundStyle(.secondary).padding(.top,40)
+                    } else {
+                        if !ai.question.isEmpty {
+                            Text(ai.question).padding(12).foregroundStyle(.white)
+                                .background(Color.accentColor,in:RoundedRectangle(cornerRadius:18))
+                                .frame(maxWidth:.infinity,alignment:.trailing)
+                        }
+                        if ai.busy { ProgressView().padding(.leading,6) }
+                        if !ai.answer.isEmpty {
+                            Text(ai.answer).textSelection(.enabled).padding(12)
+                                .background(Color(.secondarySystemBackground),in:RoundedRectangle(cornerRadius:18))
+                                .frame(maxWidth:.infinity,alignment:.leading)
+                        }
+                    }
+                    if !ai.status.isEmpty && !ai.busy {
+                        Text(ai.status).font(.caption).foregroundStyle(.secondary)
+                    }
+                }.padding(16)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge:.bottom) {
+                HStack(spacing:8) {
+                    TextField("Hỏi AI…",text:$typed,axis:.vertical).lineLimit(1...4).focused($inputFocused)
+                        .padding(.horizontal,14).padding(.vertical,10)
+                        .background(Color(.tertiarySystemFill),in:RoundedRectangle(cornerRadius:20))
+                    if ai.busy {
+                        Button { ai.cancel() } label: { Image(systemName:"stop.circle.fill").font(.title) }
+                            .tint(.red).accessibilityLabel("Hủy câu hỏi")
+                    } else {
+                        Button { ai.askTyped(typed); typed=""; inputFocused=false } label: { Image(systemName:"arrow.up.circle.fill").font(.title) }
+                            .disabled(typed.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty).accessibilityLabel("Gửi")
+                    }
+                }.padding(.horizontal,12).padding(.vertical,8).background(.bar)
+            }
+            .navigationTitle("Trợ lý AI").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement:.topBarTrailing) {
+                    Button("Cài đặt AI",systemImage:"gearshape") { showingSettings=true }
+                }
+            }
+            .sheet(isPresented:$showingSettings) { AISettingsView(ai:ai,bluetooth:bluetooth) }
+        }
+    }
+}
+
+private struct AISettingsView: View {
+    @ObservedObject var ai: AIChatModel
+    @ObservedObject var bluetooth: BluetoothLink
+    @Environment(\.dismiss) private var dismiss
+    @State private var key=""
     var body: some View {
         NavigationStack {
             Form {
-                Section("Trợ lý trên HUD") {
-                    Label(bluetooth.voiceReady ? "Mic HUD đã có kênh kết nối" : "Đang chờ kênh AI của HUD",
-                          systemImage:bluetooth.voiceReady ? "checkmark.circle.fill" : "antenna.radiowaves.left.and.right")
-                    Text("Vuốt từ cạnh dưới HUD lên để mở AI. Giữ trên vùng chat để nói, thả để gửi; kéo xuống khi đang giữ để hủy. Vuốt xuống từ thanh đầu để đóng AI.")
-                    Text("Thử: ‘Dừng nhạc’, ‘Bài tiếp theo’, ‘Thông báo mới nhất’, ‘Tóm tắt thông báo’, ‘Đổi nền sáng’, ‘Màn hình sáng một phút’.").font(.footnote)
-                    Text("AI đọc các mục HUD đã nhận. Khi bạn yêu cầu tóm tắt, nội dung ba thông báo mới nhất được gửi tới model đã chọn.").font(.footnote).foregroundStyle(.secondary)
-                    if !ai.permissionReady {
-                        Button("Cho phép nhận dạng giọng nói") { Task { _=await ai.authorize() } }
-                    }
-                    Text(ai.status).font(.footnote).foregroundStyle(.secondary)
-                }
-                if !ai.question.isEmpty || !ai.answer.isEmpty {
-                    Section("Hội thoại") {
-                        Text(ai.question).foregroundStyle(.tint)
-                        if ai.busy { ProgressView("Đang xử lý…") }
-                        if !ai.answer.isEmpty { Text(ai.answer).textSelection(.enabled) }
-                        if ai.busy { Button("Hủy câu hỏi",role:.destructive) { ai.cancel() } }
-                    }
-                }
-                Section {
-                    Toggle("Đọc câu trả lời qua loa HUD",isOn:$ai.spokenReplies)
-                    Picker("Nguồn giọng đọc",selection:$ai.speechProvider) {
-                        Text("Edge TTS · trực tuyến").tag("edge")
-                        Text("Giọng iPhone").tag("apple")
+                Section("Giọng đọc") {
+                    Toggle("Đọc trả lời qua loa HUD",isOn:$ai.spokenReplies)
+                    Picker("Nguồn",selection:$ai.speechProvider) {
+                        Text("Edge TTS").tag("edge"); Text("Giọng iPhone").tag("apple")
                     }
                     if ai.speechProvider=="edge" {
-                        Picker("Giọng tiếng Việt",selection:$ai.edgeVoice) {
+                        Picker("Giọng",selection:$ai.edgeVoice) {
                             Text("Hoài My · Nữ").tag("vi-VN-HoaiMyNeural")
                             Text("Nam Minh · Nam").tag("vi-VN-NamMinhNeural")
                         }
                     } else {
-                    Picker("Giọng đọc",selection:$ai.voiceIdentifier) {
-                        Text("Mặc định tiếng Việt").tag("")
-                        ForEach(ai.availableVoices,id:\.identifier) { voice in
-                            Text("\(voice.name) · \(voice.language)").tag(voice.identifier)
+                        Picker("Giọng",selection:$ai.voiceIdentifier) {
+                            Text("Mặc định").tag("")
+                            ForEach(ai.availableVoices,id:\.identifier) { Text("\($0.name) · \($0.language)").tag($0.identifier) }
                         }
                     }
-                    }
-                    Button("Lưu giọng đọc") { ai.saveVoiceSettings() }
-                    Button("Nghe thử giọng trên HUD",systemImage:"speaker.wave.2") { ai.previewVoice() }
-                        .disabled(!bluetooth.voiceReady)
-                } header: { Text("Giọng đọc AI") }
-                footer: { Text("Edge TTS dùng Internet, gửi nội dung cần đọc tới Microsoft và không cần API key riêng. Âm thanh phát qua loa ESP32. Có thể chọn giọng iPhone để dùng giọng tải sẵn. Âm lượng chỉnh trong Cài đặt; giữ mic trên HUD để ngắt lời đọc.") }
-                    .disabled(ai.busy || ai.speaking)
-                if ai.speaking {
-                    Section {
-                        ProgressView("Đang tạo hoặc phát giọng đọc…")
-                        Button("Dừng đọc",role:.destructive) { ai.stopSpeaking() }
-                    }
-                }
+                    Button("Nghe thử",systemImage:"play.circle") { ai.previewVoice() }.disabled(!bluetooth.voiceReady)
+                }.disabled(ai.busy || ai.speaking)
+
                 Section {
-                    TextEditor(text:$ai.systemPrompt)
-                        .frame(minHeight:140)
-                        .accessibilityLabel("Prompt hướng dẫn AI")
-                    Button("Lưu prompt") { ai.savePrompt() }
-                    Button("Khôi phục mặc định") {
-                        ai.systemPrompt=AIChatModel.defaultPrompt; ai.savePrompt()
+                    Picker("Nhà cung cấp",selection:Binding(get:{ ai.provider },set:{ ai.save(key:key); key=""; ai.selectProvider($0) })) {
+                        Text("9router").tag("router"); Text("Gemini").tag("gemini")
+                    }.pickerStyle(.segmented)
+                    if !ai.isGemini {
+                        TextField("Địa chỉ https://…/v1",text:$ai.endpoint).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
                     }
-                } header: {
-                    Text("Hướng dẫn AI (prompt)")
-                } footer: {
-                    Text("AI luôn biết đang hiển thị trên HUD ESP32-S3, màn hình 240×320. Bạn được tùy chỉnh toàn bộ hướng dẫn trả lời ở trên. Lưu để áp dụng cho cả mic HUD và câu hỏi nhập chữ. Đổi prompt sẽ bắt đầu ngữ cảnh trò chuyện mới.")
-                }.disabled(ai.busy)
-                Section("Kết nối 9router") {
-                    TextField("https://…/v1",text:$ai.endpoint).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                    SecureField(ai.hasKey ? "Đã lưu key; để trống để giữ" : "API key của 9router",text:$key)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    TextField("Tên model",text:$ai.model).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    if !ai.models.isEmpty {
-                        Picker("Chọn model",selection:$ai.model) {
+                    if !ai.savedKeyHint.isEmpty {
+                        HStack {
+                            Label("Key đã lưu \(ai.savedKeyHint)",systemImage:"checkmark.seal.fill").foregroundStyle(.green)
+                            Spacer()
+                            Button("Xóa",role:.destructive) { ai.clearKey() }.buttonStyle(.borderless)
+                        }
+                    }
+                    HStack {
+                        SecureField(ai.hasKey ? "Dán key mới để thay" : "Dán API key",text:$key)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .onSubmit { ai.save(key:key); key="" }
+                        Button("Lưu") { ai.save(key:key); key=""; Task { await ai.loadModels() } }
+                            .buttonStyle(.borderedProminent).disabled(key.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)
+                    }
+                    if ai.models.isEmpty {
+                        TextField("Model",text:$ai.model).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    } else {
+                        Picker("Model",selection:$ai.model) {
                             Text("Chọn…").tag("")
                             ForEach(ai.models,id:\.self) { Text($0).tag($0) }
                         }
                     }
-                    Button("Lưu cài đặt") { ai.save(key:key); key="" }.disabled(ai.busy)
-                    Button("Tải danh sách model") {
-                        ai.save(key:key); key=""; Task { await ai.loadModels() }
+                    Button { ai.save(key:key); key=""; Task { await ai.loadModels() } } label: {
+                        HStack { Text("Tải danh sách model"); Spacer(); if ai.loadingModels { ProgressView() } }
                     }.disabled(ai.loadingModels || ai.busy)
-                    Text("Khóa được lưu trên iPhone. Nhận dạng tiếng Việt có thể cần Internet; dịch vụ AI phụ thuộc tài khoản và model bạn chọn.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                } header: { Text("Kết nối AI") }
+                footer: {
+                    VStack(alignment:.leading,spacing:4) {
+                    Text(ai.status).foregroundStyle(.primary)
+                    if ai.isGemini {
+                        Text("Lấy API key miễn phí ở aistudio.google.com/apikey. Mặc định gemini-3.5-flash-lite: nhanh, miễn phí 500 lượt/ngày; Gemma miễn phí nhưng chậm (30–60 giây); nếu dùng Gemma nên chọn gemma-4-26b-a4b-it, nhanh hơn bản 31b. Key lưu trong Keychain của iPhone.")
+                    } else { Text("Key lưu trong Keychain của iPhone.") }
+                    }
                 }
-                Section("Thử kết nối bằng chữ") {
-                    TextField("Nhập câu hỏi thử",text:$typed,axis:.vertical)
-                    Button("Gửi câu hỏi") { ai.askTyped(typed) }.disabled(ai.busy || typed.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)
+
+                Section {
+                    NavigationLink("Hướng dẫn cho AI (prompt)") { AIPromptView(ai:ai) }
                 }
-            }.navigationTitle("Trợ lý AI")
+            }
+            .navigationTitle("Cài đặt AI").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement:.confirmationAction) { Button("Xong") { dismiss() } } }
+            .onChange(of:ai.spokenReplies) { _,_ in ai.saveVoiceSettings() }
+            .onChange(of:ai.speechProvider) { _,_ in ai.saveVoiceSettings() }
+            .onChange(of:ai.edgeVoice) { _,_ in ai.saveVoiceSettings() }
+            .onChange(of:ai.voiceIdentifier) { _,_ in ai.saveVoiceSettings() }
+            .onChange(of:ai.model) { _,_ in ai.save(key:"") }
+            .onDisappear { ai.save(key:key); key="" }
         }
+    }
+}
+
+private struct AIPromptView: View {
+    @ObservedObject var ai: AIChatModel
+    var body: some View {
+        Form {
+            Section {
+                TextEditor(text:$ai.systemPrompt).frame(minHeight:260)
+            } footer: { Text("Tự lưu khi quay lại. Đổi prompt sẽ bắt đầu cuộc trò chuyện mới.") }
+            Section {
+                Button("Khôi phục mặc định",role:.destructive) { ai.systemPrompt=AIChatModel.defaultPrompt }
+            }
+        }
+        .navigationTitle("Prompt").navigationBarTitleDisplayMode(.inline)
+        .onDisappear { ai.savePrompt() }
+        .disabled(ai.busy)
     }
 }

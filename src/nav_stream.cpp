@@ -7,6 +7,7 @@
 #include <esp_heap_caps.h>
 #include <new>
 #include <atomic>
+#include <algorithm>
 
 namespace {
 uint8_t* front;
@@ -21,6 +22,10 @@ uint32_t displayedFrame = 0;
 uint32_t controlSent = 0;
 bool ready = false;
 bool cleared = false;
+// Wallpaper: the phone sends [6] and then one 320x240 JPEG over the map transfer.
+bool wallpaperNext = false, wallpaperReady = false;
+uint8_t* wallpaper = nullptr;
+size_t wallpaperSize = 0;
 size_t readySize = 0;
 uint32_t frames = 0, rejected = 0;
 std::atomic<bool> externalGuidance{false};
@@ -36,6 +41,38 @@ class SpeedInput : public NimBLECharacteristicCallbacks {
         speedTenths=speed==65535 ? -1 : speed; speedAt=millis();
     }
 } speedInput;
+portMUX_TYPE infoLock = portMUX_INITIALIZER_UNLOCKED;
+TripInfo trip;
+WeatherInfo weather;
+TodayDistance today;
+uint32_t le32(const uint8_t* p) { return p[0] | uint32_t(p[1])<<8 | uint32_t(p[2])<<16 | uint32_t(p[3])<<24; }
+uint16_t le16(const uint8_t* p) { return p[0] | uint16_t(p[1])<<8; }
+class InfoInput : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo& peer) override {
+        if (!peer.isEncrypted()) return;
+        const auto value=ch->getValue();
+        const uint8_t* b=value.data(); const size_t n=value.size();
+        if (n>=12 && b[0]==1) {
+            TripInfo next; next.active=true; next.receivedAt=millis()|1;
+            next.remainingMetres=le32(b+1); next.turnMetres=le32(b+5);
+            next.etaMinute=le16(b+9); next.maneuver=b[11];
+            size_t size=std::min(n-12,sizeof(next.instruction)-1);
+            while (size && 12+size<n && (b[12+size]&0xC0)==0x80) --size; // never cut inside a UTF-8 sequence
+            memcpy(next.instruction,b+12,size);
+            portENTER_CRITICAL(&infoLock); trip=next; portEXIT_CRITICAL(&infoLock);
+        } else if (n==1 && b[0]==2) {
+            portENTER_CRITICAL(&infoLock); trip=TripInfo{}; portEXIT_CRITICAL(&infoLock);
+        } else if (n==9 && b[0]==4) {
+            TodayDistance next; next.valid=true; next.metres=le32(b+1); next.dayKey=le32(b+5);
+            portENTER_CRITICAL(&infoLock); today=next; portEXIT_CRITICAL(&infoLock);
+        } else if (n==12 && b[0]==3) {
+            WeatherInfo next; next.valid=true; next.receivedAt=millis()|1;
+            next.rainChance=std::min<uint8_t>(100,b[1]); next.rainInMinutes=le16(b+2);
+            next.tempTenths=int16_t(le16(b+4)); next.sunriseMinute=le16(b+6); next.sunsetMinute=le16(b+8);
+            portENTER_CRITICAL(&infoLock); weather=next; portEXIT_CRITICAL(&infoLock);
+        }
+    }
+} infoInput;
 class Incoming : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& peer) override {
         if (!peer.isEncrypted() || !guard) return;
@@ -45,6 +82,11 @@ class Incoming : public NimBLECharacteristicCallbacks {
             externalGuidance = value[1];
             xSemaphoreGive(guard); return;
         }
+        if (value.size() == 1 && value[0] == 6) {
+            receiver->reset(); receiver->expect(hudnav::WALL_WIDTH, hudnav::WALL_HEIGHT);
+            wallpaperNext = true;
+            xSemaphoreGive(guard); return;
+        }
         if (value.size() == 1 && value[0] == 4) {
             receiver->reset(); ready = false; cleared = true;
             xSemaphoreGive(guard);
@@ -52,11 +94,18 @@ class Incoming : public NimBLECharacteristicCallbacks {
         }
         hudnav::Result result = hudnav::Result::Rejected;
         if (!ready) result = receiver->feed(value.data(), value.size());
-        if (result == hudnav::Result::Complete) {
+        if (result == hudnav::Result::Complete && wallpaperNext) {
+            // Kept apart from map frames: copy out and let the UI save it.
+            if (wallpaper) { memcpy(wallpaper, back, receiver->size()); wallpaperSize = receiver->size(); wallpaperReady = true; }
+            wallpaperNext = false; receiver->reset(); receiver->expect(hudnav::WIDTH, hudnav::HEIGHT);
+        } else if (result == hudnav::Result::Complete) {
             readySize = receiver->size();
             ready = true;
             ++frames;
-        } else if (result == hudnav::Result::Rejected) ++rejected;
+        } else if (result == hudnav::Result::Rejected) {
+            ++rejected;
+            if (wallpaperNext && value.size() == 5 && value[0] == 3) { wallpaperNext = false; receiver->expect(hudnav::WIDTH, hudnav::HEIGHT); }
+        }
         if (value.size() == 5 && value[0] == 3) {
             const uint8_t reply[] = {uint8_t(result == hudnav::Result::Complete ? 0 : 1),
                 value[1], value[2], value[3], value[4]};
@@ -72,6 +121,7 @@ bool navStreamBegin(NimBLEServer* server) {
     front = static_cast<uint8_t*>(heap_caps_malloc(hudnav::MAX_IMAGE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     back = static_cast<uint8_t*>(heap_caps_malloc(hudnav::MAX_IMAGE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     guard = xSemaphoreCreateMutex();
+    wallpaper = static_cast<uint8_t*>(heap_caps_malloc(hudnav::MAX_IMAGE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!front || !back || !guard) return false;
     receiver = new (std::nothrow) hudnav::Receiver(back, hudnav::MAX_IMAGE);
     if (!receiver) return false;
@@ -82,6 +132,9 @@ bool navStreamBegin(NimBLEServer* server) {
     auto speed=service->createCharacteristic("ee43a104-1b32-4d0f-9ab8-2248b0a01000",
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
     speed->setCallbacks(&speedInput);
+    auto info=service->createCharacteristic("ee43a106-1b32-4d0f-9ab8-2248b0a01000",
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
+    info->setCallbacks(&infoInput);
     auto rx = service->createCharacteristic("ee43a101-1b32-4d0f-9ab8-2248b0a01000",
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
     incomingChannel = rx;
@@ -94,13 +147,15 @@ void navStreamReset() {
     aiVoiceReset();
     if (!guard) return;
     xSemaphoreTake(guard, portMAX_DELAY);
-    receiver->reset();
+    receiver->reset(); receiver->expect(hudnav::WIDTH, hudnav::HEIGHT);
+    wallpaperNext = false;
     ready = false;
     cleared = true;
     externalGuidance = false;
     displayedFrame = 0;
     speedTenths=-1; speedAt=0;
     xSemaphoreGive(guard);
+    portENTER_CRITICAL(&infoLock); trip=TripInfo{}; portEXIT_CRITICAL(&infoLock);
 }
 bool navStreamTake(const uint8_t*& bytes, size_t& size) {
     if (!guard) return false;
@@ -144,4 +199,28 @@ bool navStreamControl(uint8_t command, int16_t dx, int16_t dy) {
     const bool sent=acknowledgement->notify(value,sizeof(value),peer.getConnHandle());
     if(sent) ++controlSent;
     return sent;
+}
+bool navStreamTrip(TripInfo& out) {
+    portENTER_CRITICAL(&infoLock); out=trip; portEXIT_CRITICAL(&infoLock);
+    // The phone refreshes at least every 10 s while guiding.
+    if (out.active && millis()-out.receivedAt>30000) out.active=false;
+    return out.active;
+}
+bool navStreamWeather(WeatherInfo& out) {
+    portENTER_CRITICAL(&infoLock); out=weather; portEXIT_CRITICAL(&infoLock);
+    if (out.valid && millis()-out.receivedAt>3UL*3600*1000) out.valid=false;
+    return out.valid;
+}
+bool navStreamTakeWallpaper(uint8_t* out, size_t capacity, size_t& size) {
+    if (!guard) return false;
+    xSemaphoreTake(guard, portMAX_DELAY);
+    const bool have = wallpaperReady && wallpaperSize <= capacity;
+    if (have) { memcpy(out, wallpaper, wallpaperSize); size = wallpaperSize; }
+    wallpaperReady = false;
+    xSemaphoreGive(guard);
+    return have;
+}
+bool navStreamToday(TodayDistance& out) {
+    portENTER_CRITICAL(&infoLock); out=today; portEXIT_CRITICAL(&infoLock);
+    return out.valid;
 }

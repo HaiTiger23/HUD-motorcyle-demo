@@ -11,3 +11,7 @@ void companionUiPrintStatus();
 bool companionUiNavigationActive();
 bool companionUiTouch(bool down,int x,int y,bool wakeOnly);
 void companionUiLayout(int width,int height);
+// True once after a new (not pre-existing) allowed notification arrived; wakes the display.
+bool companionUiConsumeWakeRequest();
+// Backlight level in percent: the manual setting, or the day/night level when automatic.
+uint8_t companionUiBrightness();

@@ -111,8 +111,8 @@ for invalid in ["{\"action\":\"delete_all\"}","{\"action\":\"set_theme\"}","{\"a
     do { _=try HUDAssistantPlan.parse(invalid); preconditionFailure("Unsafe action accepted") } catch {}
 }
 precondition(HUDAssistantAction.make("set_timeout",value:0)?.value==0)
-precondition(HUDAssistantAction.make("set_face",value:7)?.value==7)
-precondition(HUDAssistantAction.make("set_face",value:8)==nil)
+precondition(HUDAssistantAction.make("set_face",value:8)?.value==8)
+precondition(HUDAssistantAction.make("set_face",value:9)==nil)
 var toolAssembly=HUDToolAssembly(id:1)
 let split=Array("ẽ".utf8)
 let partialTool=try toolAssembly.feed(Data([0xB0,1,0,0,0,0,0,0,0,split[0]]))

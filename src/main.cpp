@@ -1,11 +1,16 @@
 #include <Arduino.h>
+#include <algorithm>
 #include <TFT_eSPI.h>
 #include <Wire.h>
+#include <nvs.h>
 #include <lvgl.h>
 
 #include "board_config.h"
 #include "ai_voice.h"
 #include "companion_ui.h"
+#include "battery.h"
+#include "wallpaper.h"
+#include "lcd_dma.h"
 #include "ili9341v_panel.h"
 #include "phone_link.h"
 #include "hud_settings.h"
@@ -16,13 +21,17 @@ namespace {
 constexpr uint16_t SCREEN_WIDTH = 320;
 constexpr uint16_t SCREEN_HEIGHT = 240;
 constexpr uint8_t TFT_ROTATION = 1;
-constexpr uint16_t LVGL_BUFFER_LINES = 20;
+constexpr uint16_t LVGL_BUFFER_LINES = 40; // fewer strips per frame (25.6 KB internal RAM)
 constexpr uint32_t HUD_UPDATE_INTERVAL_MS = 700;
 constexpr uint32_t BUTTON_PULSE_MS = 180;
 
 TFT_eSPI tft;
 lv_display_t* display;
 alignas(4) uint16_t displayBuffer[SCREEN_WIDTH * LVGL_BUFFER_LINES];
+// Second strip for esp_lcd DMA: LVGL renders one while the other is being sent.
+alignas(4) uint16_t displayBuffer2[SCREEN_WIDTH * LVGL_BUFFER_LINES];
+bool displayDma = false;
+constexpr uint8_t MADCTL[4] = {0x48, 0x28, 0x88, 0xE8}; // TFT_eSPI ILI9341 rotations, BGR
 uint32_t lastHudUpdate = 0;
 uint32_t buttonPressedUntil = 0;
 lv_obj_t* pressedButton = nullptr;
@@ -34,7 +43,11 @@ bool lastTouchDown=false;
 uint8_t displayRotation=0;
 void setBacklight(bool awake) {
     static int previous=-1;
+#ifdef HUD_DEMO_ONLY
     const int duty=huddisplay::duty(hudHardwareSettingsGet().brightness,awake);
+#else
+    const int duty=huddisplay::duty(companionUiBrightness(),awake);
+#endif
     if(previous!=duty) { ledcWrite(2,duty); previous=duty; }
 }
 
@@ -109,6 +122,14 @@ void serviceDisplayTimeout() {
             setBacklight(true);
         }
     }
+    if (companionUiConsumeWakeRequest()) {
+        lastTouchAt = millis();
+        if (!screenAwake) {
+            screenAwake = true;
+            setBacklight(true);
+            Serial.println("Display awake: notification");
+        }
+    }
 #endif
     static uint32_t previousTimeout = timeout;
     if (previousTimeout != timeout) {
@@ -123,6 +144,8 @@ void serviceDisplayTimeout() {
     }
 }
 
+// Blocking flush. TFT_eSPI's DMA path (pushImageDMA) only delivered the first strip
+// on this ESP32-S3 board and left the rest of the screen black, so it is not used.
 void flushDisplay(lv_display_t* display, const lv_area_t* area, uint8_t* pixels) {
     const uint32_t width = static_cast<uint32_t>(area->x2 - area->x1 + 1);
     const uint32_t height = static_cast<uint32_t>(area->y2 - area->y1 + 1);
@@ -148,13 +171,17 @@ void initDisplay() {
     lv_init();
     display = lv_display_create(tft.width(), tft.height());
     lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_buffers(
-        display,
-        displayBuffer,
-        nullptr,
-        sizeof(displayBuffer),
-        LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_display_set_flush_cb(display, flushDisplay);
+    // Hand the bus to esp_lcd for DMA transfers; TFT_eSPI only did the panel init above.
+    displayDma = lcdDmaBegin(display, sizeof(displayBuffer));
+    Serial.printf("Display transfer: %s\n", displayDma ? "esp_lcd DMA" : "TFT_eSPI blocking");
+    if (displayDma) {
+        lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565_SWAPPED);
+        lv_display_set_buffers(display, displayBuffer, displayBuffer2, sizeof(displayBuffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+        lv_display_set_flush_cb(display, lcdDmaFlush);
+    } else {
+        lv_display_set_buffers(display, displayBuffer, nullptr, sizeof(displayBuffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+        lv_display_set_flush_cb(display, flushDisplay);
+    }
 }
 void serviceHardwareSettings() {
     const auto& hardware=hudHardwareSettingsGet();
@@ -163,9 +190,16 @@ void serviceHardwareSettings() {
     if(previousVolume!=hardware.speakerVolume && aiVoiceSetSpeakerVolume(hardware.speakerVolume)) previousVolume=hardware.speakerVolume;
     if(displayRotation!=hardware.rotation && !lastTouchDown && !aiVoiceBusy()) {
         displayRotation=hardware.rotation;
-        tft.setRotation((TFT_ROTATION+displayRotation)%4); tft.fillScreen(TFT_BLACK);
-        lv_display_set_resolution(display,tft.width(),tft.height());
-        lv_display_set_buffers(display,displayBuffer,nullptr,sizeof(displayBuffer),LV_DISPLAY_RENDER_MODE_PARTIAL);
+        if(displayDma) {
+            // TFT_eSPI no longer owns the bus: rotate with MADCTL and repaint everything.
+            lcdDmaWait();
+            lcdDmaSetMadctl(MADCTL[(TFT_ROTATION+displayRotation)%4]);
+            lv_obj_invalidate(lv_screen_active());
+        } else {
+            tft.setRotation((TFT_ROTATION+displayRotation)%4); tft.fillScreen(TFT_BLACK);
+            lv_display_set_resolution(display,tft.width(),tft.height());
+            lv_display_set_buffers(display,displayBuffer,nullptr,sizeof(displayBuffer),LV_DISPLAY_RENDER_MODE_PARTIAL);
+        }
         if(touchInput) lv_indev_reset(touchInput,nullptr);
         companionUiLayout(tft.width(),tft.height());
         lastTouchAt=millis(); swallowWakeTouch=true;
@@ -281,6 +315,52 @@ void updateRandomHudState() {
     }
 }
 
+
+// Settings are stored in NVS; a full partition makes every save roll back.
+void printNvs() {
+    nvs_stats_t stats{};
+    if (nvs_get_stats(nullptr, &stats) == ESP_OK)
+        Serial.printf("NVS: used=%u free=%u total=%u namespaces=%u\n", unsigned(stats.used_entries),
+                      unsigned(stats.free_entries), unsigned(stats.total_entries), unsigned(stats.namespace_count));
+    nvs_iterator_t it = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY);
+    while (it) {
+        nvs_entry_info_t info; nvs_entry_info(it, &info);
+        size_t used = 0; nvs_handle_t h;
+        if (nvs_open(info.namespace_name, NVS_READONLY, &h) == ESP_OK) {
+            if (info.type == NVS_TYPE_BLOB) nvs_get_blob(h, info.key, nullptr, &used);
+            else if (info.type == NVS_TYPE_STR) nvs_get_str(h, info.key, nullptr, &used);
+            nvs_close(h);
+        }
+        Serial.printf("NVS entry: %s/%s type=%u bytes=%u\n", info.namespace_name, info.key, unsigned(info.type), unsigned(used));
+        it = nvs_entry_next(it);
+    }
+    nvs_release_iterator(it);
+}
+
+// Removes namespaces left by an older firmware. Keeps this firmware's settings,
+// BLE bonds (iPhone pairing) and RF calibration.
+void cleanNvs() {
+    const char* keep[] = {"hud-settings", "nimble_bond", "phy"};
+    char names[32][16]{}; int count = 0;
+    nvs_iterator_t it = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY);
+    while (it) {
+        nvs_entry_info_t info; nvs_entry_info(it, &info);
+        bool known = false;
+        for (const char* k : keep) known = known || !strcmp(info.namespace_name, k);
+        for (int i = 0; i < count; ++i) known = known || !strcmp(names[i], info.namespace_name);
+        if (!known && count < 32) strlcpy(names[count++], info.namespace_name, sizeof(names[0]));
+        it = nvs_entry_next(it);
+    }
+    nvs_release_iterator(it);
+    for (int i = 0; i < count; ++i) {
+        nvs_handle_t h;
+        esp_err_t err = nvs_open(names[i], NVS_READWRITE, &h);
+        if (err == ESP_OK) { err = nvs_erase_all(h); if (err == ESP_OK) err = nvs_commit(h); nvs_close(h); }
+        Serial.printf("NVSCLEAN: %s %s\n", names[i], err == ESP_OK ? "erased" : esp_err_to_name(err));
+    }
+    printNvs();
+}
+
 void handleSerialCommands() {
     static char command[96];
     static size_t size = 0;
@@ -292,7 +372,11 @@ void handleSerialCommands() {
             continue;
         }
         command[size] = '\0';
-        if (strcmp(command, "STATUS") == 0) {
+        if (strcmp(command, "NVSCLEAN") == 0) {
+            cleanNvs();
+        } else if (strcmp(command, "NVS") == 0) {
+            printNvs();
+        } else if (strcmp(command, "STATUS") == 0) {
             Serial.printf("HUD iPhone running; heap=%u; touch=%s\n", ESP.getFreeHeap(),
                           touchInput ? "FT6336 ready" : "unavailable");
             phoneLinkPrintStatus();
@@ -302,6 +386,19 @@ void handleSerialCommands() {
             Serial.printf("Display idle: awake=%u; backlight=%u; idle_ms=%u; timeout_ms=%u\n",
                           screenAwake, ledcRead(2),
                           uint32_t(millis() - lastTouchAt), hudSettingsGet().timeoutSeconds * 1000UL);
+        } else if (strcmp(command, "BENCH") == 0) {
+            // Full-screen redraw cost (render + transfer), averaged over 20 frames.
+            uint32_t total = 0, worst = 0;
+            for (int i = 0; i < 20; ++i) {
+                lv_obj_invalidate(lv_screen_active());
+                const uint32_t start = micros();
+                lv_refr_now(display);
+                if (displayDma) lcdDmaWait();
+                const uint32_t us = micros() - start;
+                total += us; worst = std::max(worst, us);
+            }
+            Serial.printf("BENCH full frame: avg=%ums worst=%ums (%.1f fps)\n", unsigned(total / 20000), unsigned(worst / 1000),
+                          20e6 / double(total));
         } else if (strcmp(command, "REFRESH") == 0) {
             const auto result = phoneLinkRefreshNotifications();
             Serial.printf("ANCS refresh request: %u (0=queued, 1=offline, 2=pairing, 3=busy)\n",
@@ -330,6 +427,7 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     randomSeed(micros());
+    wallpaperBegin(); // before settings: migrating the old wallpaper face writes its prefs
     hudSettingsBegin();
     initDisplay();
     initTouch();
@@ -338,6 +436,7 @@ void setup() {
     ui_init();
     updateRandomHud();
 #else
+    batteryBegin();
     companionUiBegin();
     companionUiLayout(tft.width(),tft.height());
     lv_mem_monitor_t memory{}; lv_mem_monitor(&memory);
@@ -379,5 +478,7 @@ void loop() {
     const uint32_t frameMs = millis() - frameStart;
     if (frameMs >= 60) Serial.printf("LVGL slow frame: %ums\n", unsigned(frameMs));
     serviceDisplayTimeout();
+    static uint32_t backlightAt=0; // follows the day/night ramp; setBacklight skips unchanged duty
+    if(now-backlightAt>=1000) { backlightAt=now; setBacklight(screenAwake); }
     delay(5);
 }

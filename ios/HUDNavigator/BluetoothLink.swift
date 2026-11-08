@@ -57,6 +57,7 @@ struct HUDAppRule: Identifiable {
     static let settingsID = CBUUID(string: "ee43a103-1b32-4d0f-9ab8-2248b0a01000")
     static let speedID = CBUUID(string: "ee43a104-1b32-4d0f-9ab8-2248b0a01000")
     static let voiceID = CBUUID(string: "ee43a105-1b32-4d0f-9ab8-2248b0a01000")
+    static let infoID = CBUUID(string: "ee43a106-1b32-4d0f-9ab8-2248b0a01000")
     @Published var voiceReady = false
     @Published var voiceActive = false
     @Published var speakerActive=false
@@ -70,10 +71,22 @@ struct HUDAppRule: Identifiable {
     private var voiceWriting = false
     private var voiceTimer: Timer?
     private var speedChannel: CBCharacteristic?
+    private var infoChannel: CBCharacteristic?
     var onMapControl: ((HUDMapControl) -> Void)?
     @Published var settings = HUDSettings()
     @Published var hardware = HUDHardwareSettings()
     @Published var hardwareReady=false
+    /// Owner PIN state on the HUD (nil = unknown / old firmware).
+    @Published var ownerPinSet: Bool?
+    /// Wallpaper face: clock colour (0xRRGGBB) and whether the HUD holds a photo; nil = unknown.
+    @Published var wallpaperColor: Int?
+    @Published var wallpaperHasImage: Bool?
+    /// Background for every face: false = theme colour, true = photo.
+    @Published var wallpaperBackground: Bool?
+    @Published var wallpaperStatus = ""
+    private var wallpaperTransfer = false
+    /// Called when the HUD link drops on its own (out of range, HUD off), not when the app disconnects.
+    var onLinkLost: (() -> Void)?
     @Published var apps: [HUDAppRule] = []
     @Published var settingsReady = false
     @Published var settingsBusy = false
@@ -251,6 +264,7 @@ struct HUDAppRule: Identifiable {
         resetSettings()
         rx = nil; clearTransfer(); connectionTimeout?.invalidate()
         status = "Mất kết nối HUD"
+        if error != nil { onLinkLost?() }
         if reconnect { scheduleRetry(); if !appActive { attach(peripheral) } }
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -276,6 +290,7 @@ struct HUDAppRule: Identifiable {
         }
         rx = chars.first { $0.uuid == Self.rxID }
         speedChannel = chars.first { $0.uuid == Self.speedID }
+        infoChannel = chars.first { $0.uuid == Self.infoID }
         voiceChannel = chars.first { $0.uuid == Self.voiceID }
         if Bundle.main.bundleURL.pathExtension == "appex" { voiceChannel = nil }
         if let voiceChannel {
@@ -360,12 +375,17 @@ struct HUDAppRule: Identifiable {
             }
         }
     }
-    @discardableResult func send(jpeg: Data, externalGuidance: Bool = false) -> UInt32? {
+    /// Sends a 320x240 baseline JPEG for the wallpaper face over the map transfer.
+    @discardableResult func sendWallpaper(_ jpeg: Data) -> Bool {
+        send(jpeg: jpeg, wallpaper: true) != nil
+    }
+    @discardableResult func send(jpeg: Data, externalGuidance: Bool = false, wallpaper: Bool = false) -> UInt32? {
         guard ready, !busy, let device, rx != nil else { return nil }
         frameID &+= 1
         guard let newPackets = HUDWire.packets(jpeg: jpeg, id: frameID,
             maxWrite: device.maximumWriteValueLength(for: .withoutResponse)) else { status = "Khung bản đồ quá lớn"; return nil }
-        packets = [Data([5, externalGuidance ? 1 : 0])] + newPackets; packetIndex = 0; busy = true
+        wallpaperTransfer = wallpaper
+        packets = [wallpaper ? Data([6]) : Data([5, externalGuidance ? 1 : 0])] + newPackets; packetIndex = 0; busy = true
         frameAcknowledged = false; transferStarted = Date(); transferBytes = jpeg.count
         timeout = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in
             Task { @MainActor in
@@ -383,11 +403,18 @@ struct HUDAppRule: Identifiable {
         let value: UInt16 = kmh.map { UInt16(max(0, min(3000, ($0*10).rounded()))) } ?? 65535
         device.writeValue(Data([UInt8(value & 255), UInt8(value >> 8)]), for: speedChannel, type: .withoutResponse)
     }
+    /// Trip/weather summary (firmware characteristic ee43a106). Small and resent
+    /// periodically, so an occasional dropped write is harmless.
+    @discardableResult func sendInfo(_ payload: Data) -> Bool {
+        guard ready, let device, let infoChannel, device.canSendWriteWithoutResponse else { return false }
+        device.writeValue(payload, for: infoChannel, type: .withoutResponse)
+        return true
+    }
     private func pump() {
         guard !waitingWrite, let device, let rx else { return }
         while packetIndex < packets.count {
             let packet = packets[packetIndex]
-            if packet.first == 1 || packet.first == 3 || packet.first == 5 {
+            if packet.first == 1 || packet.first == 3 || packet.first == 5 || packet.first == 6 {
                 waitingWrite = true; packetIndex += 1
                 device.writeValue(packet, for: rx, type: .withResponse)
                 return
@@ -440,7 +467,11 @@ struct HUDAppRule: Identifiable {
         guard error == nil, let data = characteristic.value, data.count == 5, busy else { return }
         let id = (0..<4).reduce(UInt32(0)) { $0 | UInt32(data[$1 + 1]) << ($1 * 8) }
         guard id == frameID else { return }
-        status = data[0] == 0 ? "HUD đã nhận bản đồ" : "HUD từ chối khung bản đồ"
+        if wallpaperTransfer {
+            wallpaperTransfer = false
+            wallpaperStatus = data[0] == 0 ? "HUD đã nhận ảnh nền" : "HUD không nhận ảnh. Thử ảnh khác."
+            if data[0] == 0 { wallpaperHasImage = true; wallpaperBackground = true }
+        } else { status = data[0] == 0 ? "HUD đã nhận bản đồ" : "HUD từ chối khung bản đồ" }
         frameAcknowledged = true
         print("HUD map: bytes=\(transferBytes), bleMs=\(Int(Date().timeIntervalSince(transferStarted) * 1000)), accepted=\(data[0] == 0)")
         finishTransferIfAcknowledged()
@@ -451,7 +482,7 @@ struct HUDAppRule: Identifiable {
         if frameAcknowledged && !waitingWrite && packetIndex == packets.count { clearTransfer() }
     }
     private func clearTransfer() {
-        timeout?.invalidate(); timeout = nil; busy = false; waitingWrite = false
+        timeout?.invalidate(); timeout = nil; busy = false; waitingWrite = false; wallpaperTransfer = false
         frameAcknowledged = false
         packets = []; packetIndex = 0
     }
@@ -473,6 +504,18 @@ struct HUDAppRule: Identifiable {
         enqueueSettings(0x15,[UInt8(value.brightness),UInt8(value.speakerVolume),UInt8(value.rotation)])
     }
     func testSpeaker() { enqueueSettings(0x16,[]) }
+    func setWallpaperColor(_ rgb: Int) {
+        enqueueSettings(0x18,[UInt8(rgb >> 16 & 255),UInt8(rgb >> 8 & 255),UInt8(rgb & 255)])
+    }
+    func clearWallpaper() { enqueueSettings(0x18,[0]) }
+    func setWallpaperBackground(_ photo: Bool) { wallpaperBackground = photo; enqueueSettings(0x18,[0x0B, photo ? 1 : 0]) }
+    /// 4 digits sets the owner PIN; nil clears it.
+    func setOwnerPIN(_ pin: String?) {
+        if let pin {
+            guard pin.count == 4, pin.allSatisfy(\.isASCII), pin.allSatisfy(\.isNumber) else { return }
+            enqueueSettings(0x17, Array(pin.utf8))
+        } else { enqueueSettings(0x17, [0]) }
+    }
     func setApp(_ id: String, enabled: Bool) {
         enqueueSettings(0x12, [enabled ? 1 : 0] + Array(id.utf8))
     }
@@ -483,6 +526,7 @@ struct HUDAppRule: Identifiable {
         voiceTimer?.invalidate(); voiceQueue=[]; voiceWriting=false; onVoiceDisconnected?()
         catalogRefreshNeeded=false
         settingsReady = false; settingsChannel = nil; settingsQueue = []; settingsRequest = nil
+        ownerPinSet = nil; wallpaperColor = nil; wallpaperHasImage = nil; wallpaperBackground = nil
         settingsBusy = false; settingsTimer?.invalidate(); settingsStatus = "Đang chờ HUD"
     }
     private func failSettings(_ message: String) {
@@ -545,7 +589,7 @@ struct HUDAppRule: Identifiable {
         }
     }
     private func decodeSettings(_ data: Data) -> Bool {
-        guard data.count == 7, data[0] == 1, data[1] < 8, data[2] < 8,
+        guard data.count == 7, data[0] == 1, data[1] < 8, data[2] < 9,
               [0,15,30,60,120,300].contains(Int(data[3]) | Int(data[4]) << 8), data[5] < 2, data[6] <= 24 else { return false }
         let value = HUDSettings(theme: Int(data[1]), face: Int(data[2]),
             timeout: Int(data[3]) | Int(data[4]) << 8, allowNewApps: data[5] == 1)
@@ -589,6 +633,8 @@ struct HUDAppRule: Identifiable {
             apps = []
             if !extended { enqueueSettings(0x14,[]) }
             for index in 0..<Int(data[6]) { enqueueSettings(0x13, [UInt8(index)]) }
+            enqueueSettings(0x18,[])
+            enqueueSettings(0x17,[]) // last: older firmware rejects it, which clears the queue
             settingsStatus = "Đã đọc cài đặt từ HUD"
             return
         }
@@ -603,6 +649,16 @@ struct HUDAppRule: Identifiable {
             hardwareReady=true
             settingsStatus=data[0]==0x95 ? "Đã áp dụng màn hình và loa trên HUD" : "Đã đọc cài đặt màn hình và loa"
         } else if data[0]==0x96 { settingsStatus="Đã phát âm thử trên loa HUD" }
+        else if data[0]==0x98, data.count>=7 {
+            wallpaperColor = Int(data[3]) << 16 | Int(data[4]) << 8 | Int(data[5])
+            wallpaperHasImage = data[6] == 1
+            if data.count >= 8 { wallpaperBackground = data[7] == 1 }
+        }
+        else if data[0]==0x97, data.count>=4 {
+            let changed = request.count > 2
+            ownerPinSet = data[3]==1
+            if changed { settingsStatus = ownerPinSet == true ? "Đã đặt mã PIN trên HUD" : "Đã xóa mã PIN trên HUD" }
+        }
         else if data[0] == 0x90 {
             guard decodeSettings(Data(data.dropFirst(3))) else { failSettings("Phản hồi cài đặt không hợp lệ"); return }
             settingsStatus = "HUD đã áp dụng cài đặt"

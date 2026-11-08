@@ -85,7 +85,8 @@ struct HudDestinationUi {
     }
     uint32_t shownSession=0;
     uint8_t shownPhase=255;
-    void show(uint8_t phase,const char* message,int count,const char* const* items,int width,int height,uint32_t session=0) {
+    void show(uint8_t phase,const char* message,int count,const char* const* items,int width,int height,uint32_t session=0,
+              const char* heard="") {
         const bool results=phase==1 && count>0,preview=phase==2 || phase==5,waiting=phase==6;
         if(shownSession!=session || shownPhase!=phase) {
             lv_obj_scroll_to_y(body,0,LV_ANIM_OFF); lv_obj_scroll_to_y(list,0,LV_ANIM_OFF);
@@ -101,7 +102,13 @@ struct HudDestinationUi {
             else readable[used++]=*p++;
         }
         readable[used]=0;
-        lv_label_set_text(status,results ? "Chọn điểm đến" : readable);
+        // Always show what the microphone understood, so a wrong result is explainable.
+        char text[700];
+        const bool hasHeard=heard && heard[0] && !preview && !waiting;
+        if(results) snprintf(text,sizeof(text),hasHeard ? "Kết quả: \"%s\"" : "Chọn điểm đến",heard);
+        else if(hasHeard) snprintf(text,sizeof(text),"Bạn nói: \"%s\"\n%s",heard,readable);
+        else snprintf(text,sizeof(text),"%s",readable);
+        lv_label_set_text(status,text);
         lv_obj_set_hidden(list,!results); lv_obj_set_hidden(mic,results || preview || waiting);
         lv_obj_set_hidden(start,!preview);
         for(int i=0;i<5;++i) {

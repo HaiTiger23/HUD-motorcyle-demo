@@ -155,6 +155,10 @@ class Callbacks : public NimBLEServerCallbacks {
             server->disconnect(info.getConnHandle());
             return;
         }
+        // Ask for a shorter connection interval (15-30 ms, within Apple's rules)
+        // so map frames cross the link faster.
+        server->updateConnParams(info.getConnHandle(), 12, 24, 0, 400);
+        Serial.printf("BLE connection interval: %u x1.25ms\n", unsigned(info.getConnInterval()));
         signal(PhoneEventType::Secured, generation.load());
         // Bonded iPhones may retain a pre-update GATT range. Invalidate the
         // cached database after encryption so newly added channels are read.
@@ -616,6 +620,21 @@ bool phoneLinkBegin() {
     Serial.println("HUD iPhone advertising; pair in iPhone Settings > Bluetooth");
     return true;
 }
+
+namespace { bool linkEnabled = true; }
+void phoneLinkSetEnabled(bool enabled) {
+    if (!server || enabled == linkEnabled) return;
+    linkEnabled = enabled;
+    server->advertiseOnDisconnect(enabled);
+    auto advertising = NimBLEDevice::getAdvertising();
+    if (enabled) advertising->start();
+    else {
+        advertising->stop();
+        for (const auto handle : server->getPeerDevices()) server->disconnect(handle);
+    }
+    Serial.printf("BLE %s from quick settings\n", enabled ? "enabled" : "disabled");
+}
+bool phoneLinkEnabled() { return linkEnabled; }
 
 bool phoneLinkPoll(PhoneEvent& event) {
     while (outputs && xQueueReceive(outputs, &event, 0) == pdTRUE) {

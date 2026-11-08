@@ -16,7 +16,7 @@ public struct HUDAssistantAction: Equatable {
         let code: UInt8
         switch name {
         case "set_theme": guard (0..<8).contains(value) else { return nil }; code=4
-        case "set_face": guard (0..<8).contains(value) else { return nil }; code=5
+        case "set_face": guard (0..<9).contains(value) else { return nil }; code=5
         case "set_timeout": guard [0,15,30,60,120,300].contains(value) else { return nil }; code=6
         case "show_page": guard (0..<4).contains(value) else { return nil }; code=7
         default: return nil

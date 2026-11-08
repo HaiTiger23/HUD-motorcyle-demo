@@ -3,6 +3,7 @@ import MapKit
 import CoreLocation
 import UIKit
 import Combine
+import UserNotifications
 
 @MainActor final class NavigationModel: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     @Published var results: [MKMapItem] = []
@@ -47,6 +48,30 @@ import Combine
     @Published var destinationName = ""
     @Published var destinationAddress = ""
     @Published var recentPlaces: [SavedPlace] = []
+    /// Short rain outlook for the next 3 hours, e.g. "Mưa 70% lúc 17h", empty when unknown.
+    /// Where the HUD link last dropped on its own: usually where the bike is parked.
+    @Published var parking: ParkingSpot? = ParkingSpot.load()
+    @Published var forgetAlert = UserDefaults.standard.object(forKey: "hudForgetAlert") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(forgetAlert, forKey: "hudForgetAlert")
+            if forgetAlert { Self.requestAlertPermission() }
+        }
+    }
+    @Published var rainForecast = ""
+    @Published var rainLikely = false
+    private var weatherPayload: Data?
+    private var weatherFetchedAt = Date.distantPast
+    private var weatherLocation: CLLocation?
+    private var weatherLoading = false
+    private var weatherSentAt = Date.distantPast
+    private var tripSentAt = Date.distantPast
+    private var tripSentKey = ""
+    // Distance ridden today (GPS), shown on the HUD faces.
+    @Published var todayMetres = UserDefaults.standard.double(forKey: "hudTodayMetres")
+    private var todayKey = UserDefaults.standard.integer(forKey: "hudTodayKey")
+    private var distanceFix: CLLocation?
+    private var todaySent = -1.0
+    private var todaySentAt = Date.distantPast
     private var guidanceRequested = false
     struct SavedPlace: Codable, Identifiable, Equatable {
         let name: String
@@ -58,6 +83,48 @@ import Combine
             let item = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: latitude, longitude: longitude)))
             item.name = name; return item
         }
+    }
+    /// Vietnamese results often have an empty or name-only `placemark.title`,
+    /// so build "số nhà đường, phường, quận, tỉnh" from the components.
+    static func address(of item: MKMapItem) -> String {
+        // iOS 26 moved addresses to `address`/`addressRepresentations`; the deprecated
+        // placemark comes back without street components there.
+        if #available(iOS 26.0, *) {
+            let full = item.addressRepresentations?.fullAddress(includingRegion: false, singleLine: true)
+                ?? item.address?.shortAddress ?? item.address?.fullAddress
+            if var full, !full.isEmpty {
+                if let name = item.name, full.hasPrefix(name + ", ") { full.removeFirst(name.count + 2) }
+                if full != item.name { return full }
+            }
+        }
+        let p = item.placemark
+        let street = [p.subThoroughfare, p.thoroughfare].compactMap { $0 }.joined(separator: " ")
+        var parts: [String] = []
+        for part in [street, p.subLocality ?? "", p.locality ?? "", p.subAdministrativeArea ?? "", p.administrativeArea ?? ""]
+            where !part.isEmpty && !parts.contains(part) && part != item.name { parts.append(part) }
+        if parts.isEmpty, let title = p.title, title != item.name { return title }
+        return parts.joined(separator: ", ")
+    }
+    /// "1,2 km" from the latest fix, or "" without GPS.
+    /// Places saved by older builds have no address; look them up once from the coordinate.
+    func fillRecentAddresses() async {
+        guard #available(iOS 26.0, *) else { return }
+        var changed = false
+        for (index, place) in recentPlaces.enumerated() where place.address.isEmpty || place.address == place.name {
+            let location = CLLocation(latitude: place.latitude, longitude: place.longitude)
+            guard let request = MKReverseGeocodingRequest(location: location),
+                  let item = try? await request.mapItems.first else { continue }
+            let address = Self.address(of: item)
+            guard !address.isEmpty, index < recentPlaces.count, recentPlaces[index].id == place.id else { continue }
+            recentPlaces[index] = SavedPlace(name: place.name, address: address, latitude: place.latitude, longitude: place.longitude)
+            changed = true
+        }
+        if changed, let data = try? JSONEncoder().encode(recentPlaces) { UserDefaults.standard.set(data, forKey: "hudRecentPlaces") }
+    }
+    func distanceText(to item: MKMapItem) -> String {
+        guard let latest, let target = item.placemark.location else { return "" }
+        let metres = latest.distance(from: target)
+        return metres < 1000 ? "\(Int(metres.rounded())) m" : String(format: "%.1f km", metres / 1000).replacingOccurrences(of: ".", with: ",")
     }
     var tripSummary: String {
         guard let route = plannedRoute else { return "" }
@@ -165,7 +232,7 @@ import Combine
         let data: [String:Any] = ["context":hudChoiceContext,"state":state,
             "valid":hudSearchSession != nil && Date().timeIntervalSince(hudChoiceAt)<300,
             "destination":destinationName,
-            "results":hudSearchResults.enumerated().map { ["number":$0.offset+1,"name":$0.element.name ?? "Điểm đến","address":String(($0.element.placemark.title ?? "").prefix(180))] as [String:Any] }]
+            "results":hudSearchResults.enumerated().map { ["number":$0.offset+1,"name":$0.element.name ?? "Điểm đến","address":String(Self.address(of: $0.element).prefix(180))] as [String:Any] }]
         guard let json=try? JSONSerialization.data(withJSONObject:data),let text=String(data:json,encoding:.utf8) else { return "{}" }
         return text
     }
@@ -253,22 +320,28 @@ import Combine
             Task { @MainActor [weak self] in
                 guard let self,self.bluetooth.ready==ready else { return }
                 if !ready { self.resetCamera(); self.resetMapRenderer() }
-                else { self.bluetooth.sendSpeed(self.latestSpeed) }
+                else {
+                    UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.forgotID])
+                    self.clearParking() // back in range of the HUD: you are at the bike
+                    self.bluetooth.sendSpeed(self.latestSpeed); self.weatherSentAt = .distantPast; self.tripSentAt = .distantPast; self.todaySentAt = .distantPast; self.todaySent = -1 }
                 self.updateHUDLocationActivity()
             }
         }
         if let data = UserDefaults.standard.data(forKey: "hudRecentPlaces"),
            let saved = try? JSONDecoder().decode([SavedPlace].self, from: data) { recentPlaces = Array(saved.prefix(5)) }
+        Task { await fillRecentAddresses() }
         historyObserver=bluetooth.$voiceReady.removeDuplicates().sink { [weak self] ready in
             if ready { Task { @MainActor [weak self] in self?.publishHUDHistory() } }
         }
+        bluetooth.onLinkLost = { [weak self] in Task { @MainActor in self?.hudLinkLost() } }
+        if forgetAlert { Self.requestAlertPermission() }
         locations.delegate = self
         locations.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         locations.distanceFilter = kCLDistanceFilterNone
         locations.activityType = .automotiveNavigation
         locations.pausesLocationUpdatesAutomatically = false
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.renderIfNeeded() }
+            Task { @MainActor in self?.renderIfNeeded(); self?.sendRideInfo() }
         }
     }
     func requestLocation() {
@@ -317,6 +390,8 @@ import Combine
         }
         latest = fix
         currentCoordinate = fix.coordinate
+        refreshWeatherIfNeeded(fix)
+        addTodayDistance(fix)
         if waitingToStart {
             hudGPSWaitTimer?.invalidate(); hudGPSWaitTimer=nil
             waitingToStart = false; plan(from: fix); return
@@ -340,8 +415,24 @@ import Combine
         operation.start { [weak self, weak operation] response, error in
             Task { @MainActor in
                 guard let self, self.search === operation else { return }
+                let items = response?.mapItems ?? []
+                if items.isEmpty, request.region.span.latitudeDelta > 0 && request.region.span.latitudeDelta < 1 {
+                    // Nothing nearby: search the whole country before giving up.
+                    let wide = MKLocalSearch.Request(); wide.naturalLanguageQuery = query
+                    wide.region = MKCoordinateRegion(center: request.region.center, latitudinalMeters: 1_500_000, longitudinalMeters: 1_500_000)
+                    let retry = MKLocalSearch(request: wide); self.search = retry
+                    retry.start { [weak self, weak retry] response, error in
+                        Task { @MainActor in
+                            guard let self, self.search === retry else { return }
+                            self.searching = false
+                            self.results = response?.mapItems ?? []
+                            self.status = self.results.isEmpty ? "Không tìm thấy địa điểm" : "Chọn điểm đến"
+                        }
+                    }
+                    return
+                }
                 self.searching = false
-                self.results = response?.mapItems ?? []
+                self.results = items
                 self.status = error?.localizedDescription ?? (self.results.isEmpty ? "Không tìm thấy địa điểm" : "Chọn điểm đến")
             }
         }
@@ -359,13 +450,14 @@ import Combine
         revision += 1; directions?.cancel(); planning=false; preparing=false
         waitingToStart=false
         hudSearchSession=session; hudSearchResults=[]; search?.cancel(); search=nil; searching=false; results=[]
-        guard query.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else {
             sendHUDSearch(session, phase: 3, index: 0, total: 0, text: "Không nghe rõ địa điểm. Hãy nói lại."); return
         }
         guard beginHUDBackground() else {
             sendHUDSearch(session,phase:3,index:0,total:0,text:"Mở HUD Connect rồi thử tìm lại."); return
         }
-        sendHUDSearch(session, phase: 0, index: 0, total: 0, text: "Đang tìm địa điểm…")
+        sendHUDSearch(session, phase: 0, index: 0, total: 0, text: "Đang tìm \"\(trimmed)\"…")
         let request = MKLocalSearch.Request(); request.naturalLanguageQuery = query
         if let latest { request.region = MKCoordinateRegion(center: latest.coordinate, latitudinalMeters: 20000, longitudinalMeters: 20000) }
         let operation = MKLocalSearch(request: request); search=operation; searching=true
@@ -376,11 +468,11 @@ import Combine
                 self.searching=false; self.hudSearchResults=Array((response?.mapItems ?? []).prefix(5)); self.results=self.hudSearchResults
                 HUDDiagnostics.record("HUD destination search: results=\(self.hudSearchResults.count); errorDomain=\((error as NSError?)?.domain ?? "none"); errorCode=\((error as NSError?)?.code ?? 0); appState=\(UIApplication.shared.applicationState.rawValue)")
                 guard error == nil, !self.hudSearchResults.isEmpty else {
-                    self.sendHUDSearch(session, phase: 3, index: 0, total: 0, text: error?.localizedDescription ?? "Không tìm thấy địa điểm"); return
+                    self.sendHUDSearch(session, phase: 3, index: 0, total: 0, text: error == nil ? "Không tìm thấy \"\(trimmed)\". Hãy nói tên khác." : (error?.localizedDescription ?? "")); return
                 }
                 for (index,item) in self.hudSearchResults.enumerated() {
                     let name=item.name ?? "Điểm đến"
-                    let address=item.placemark.title ?? ""
+                    let address=Self.address(of: item)
                     let distance: Int?
                     if let latest=self.latest, let location=item.placemark.location { distance=Int(location.distance(from:latest).rounded()) }
                     else { distance=nil }
@@ -468,7 +560,7 @@ import Combine
         plannedRoute = nil; route = nil; geometry = nil
         destination = item
         destinationName = item.name ?? "Điểm đến"
-        destinationAddress = item.placemark.title ?? ""
+        destinationAddress = Self.address(of: item)
         if let session=hudSearchSession, !beginHUDBackground() {
             preparing=false; status="Mở HUD Connect rồi thử chọn lại địa điểm."
             sendHUDSearch(session,phase:3,index:0,total:0,text:status); return
@@ -523,7 +615,10 @@ import Combine
         if let latest { updateProgress(latest) }
         lastRender = .distantPast; renderIfNeeded()
     }
+    private var transportFallback = false
     func changeTransport() {
+        // Ignore the change made by the walking->car fallback itself.
+        if transportFallback { transportFallback = false; return }
         guard !navigating, let destination else { return }
         prepare(to: destination)
     }
@@ -548,6 +643,14 @@ import Combine
                 HUDDiagnostics.record("HUD route result: routes=\(response?.routes.count ?? 0); errorDomain=\((error as NSError?)?.domain ?? "none"); errorCode=\((error as NSError?)?.code ?? 0)")
                 self.planning = false
                 self.preparing = false
+                if response?.routes.first == nil, request.transportType == .walking {
+                    // Apple Maps has no walking directions in many places: fall back to the car route.
+                    HUDDiagnostics.record("HUD route: walking unavailable, retrying by car")
+                    self.transportFallback = true; self.transport = "Ô tô"
+                    self.plan(from: location)
+                    self.status = "Không có tuyến đi bộ ở đây · dùng tuyến ô tô"
+                    return
+                }
                 guard let route = response?.routes.first else {
                     print("HUD route: planning failed, code=\((error as NSError?)?.code ?? -1)")
                     self.status = error?.localizedDescription ?? "Không tìm được tuyến ở khu vực này"
@@ -577,7 +680,7 @@ import Combine
                 } else {
                     self.status = "Sẵn sàng bắt đầu"
                     self.hudPreviewReady = self.hudSearchSession != nil
-                    if let session=self.hudSearchSession { self.sendHUDSearch(session, phase: self.hudSelectionFromAI ? 5 : 2, index: 0, total: 0, text: "\(self.destinationName)\n\(self.tripSummary)") }
+                    if let session=self.hudSearchSession { self.sendHUDSearch(session, phase: self.hudSelectionFromAI ? 5 : 2, index: 0, total: 0, text: "\(self.destinationName)\n\(self.tripSummary)\(self.rainLikely ? "\n\(self.rainForecast) · mang áo mưa" : "")") }
                 }
             }
         }
@@ -600,6 +703,190 @@ import Combine
             status = "Đã đến điểm đến"; instruction = "Đã đến nơi"
         }
     }
+    // MARK: Anti-theft: parking spot and "forgot the HUD" alert
+
+    nonisolated static let forgotID = "hud-forgot"
+
+    nonisolated static func requestAlertPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// The HUD dropped out of range (or was switched off). Remember where, and if it does
+    /// not come back within 40 s, ask whether it was left on the bike.
+    private func hudLinkLost() {
+        let fix = latest.flatMap { abs($0.timestamp.timeIntervalSinceNow) < 300 ? $0 : nil }
+        if let coordinate = fix?.coordinate ?? currentCoordinate {
+            let spot = ParkingSpot(latitude: coordinate.latitude, longitude: coordinate.longitude, savedAt: Date())
+            parking = spot; spot.save()
+        }
+        HUDDiagnostics.record("HUD link lost: parking saved=\(parking != nil)")
+        guard forgetAlert else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Bạn quên tháo HUD trên xe?"
+        content.body = parking != nil ? "Mất kết nối với HUD. Đã lưu chỗ đỗ xe trong HUD Connect." : "Mất kết nối với HUD."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: Self.forgotID, content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 40, repeats: false))
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    func clearParking() { parking = nil; ParkingSpot.clear() }
+
+    /// Walking route back to the bike (falls back to car where Apple has no walking data).
+    /// Returns false when you are already at the spot.
+    func routeToParking() -> Bool {
+        guard let parking else { return false }
+        if let here = currentCoordinate,
+           CLLocation(latitude: here.latitude, longitude: here.longitude)
+            .distance(from: CLLocation(latitude: parking.latitude, longitude: parking.longitude)) < 30 {
+            importStatus = "Bạn đang ở ngay chỗ đỗ xe"
+            Task { try? await Task.sleep(for: .seconds(3)); if importStatus == "Bạn đang ở ngay chỗ đỗ xe" { importStatus = "" } }
+            return false
+        }
+        transport = "Đi bộ" // the transport picker is not on screen here, so no extra re-plan fires
+        prepare(to: parking.mapItem)
+        return true
+    }
+
+    // MARK: Today's distance
+
+    private static func dayKey(_ date: Date = Date()) -> Int {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        return (c.year ?? 0) * 10000 + (c.month ?? 0) * 100 + (c.day ?? 0)
+    }
+
+    /// Adds movement between good fixes; ignores GPS jitter while standing still and gaps/jumps.
+    private func addTodayDistance(_ fix: CLLocation) {
+        let key = Self.dayKey(fix.timestamp)
+        if key != todayKey { todayKey = key; todayMetres = 0; distanceFix = nil; saveToday() }
+        guard fix.horizontalAccuracy <= 25 else { return }
+        guard let last = distanceFix else { distanceFix = fix; return }
+        let gap = fix.timestamp.timeIntervalSince(last.timestamp)
+        let step = fix.distance(from: last)
+        guard gap > 0, gap < 120, step < 2000 else { distanceFix = fix; return }  // gap or jump: restart
+        let moving = fix.speed >= 0 ? fix.speed >= 1.4 : step > 15   // ~5 km/h
+        guard moving, step >= 3 else { return }  // standing still: keep the anchor, ignore jitter
+        distanceFix = fix
+        todayMetres += step
+        if Int(todayMetres) / 100 != Int(todayMetres - step) / 100 { saveToday() }
+    }
+
+    private func saveToday() {
+        UserDefaults.standard.set(todayMetres, forKey: "hudTodayMetres")
+        UserDefaults.standard.set(todayKey, forKey: "hudTodayKey")
+    }
+
+    private func sendToday() {
+        let key = Self.dayKey()
+        let metres = todayKey == key ? todayMetres : 0
+        guard abs(metres - todaySent) >= 50 || Date().timeIntervalSince(todaySentAt) > 60 else { return }
+        var data = Data([4])
+        for v in [UInt32(max(0, min(Double(UInt32.max), metres.rounded()))), UInt32(key)] {
+            data.append(contentsOf: [UInt8(v & 255), UInt8(v >> 8 & 255), UInt8(v >> 16 & 255), UInt8(v >> 24)])
+        }
+        if bluetooth.sendInfo(data) { todaySent = metres; todaySentAt = Date() }
+    }
+
+    // MARK: Ride info and weather for the HUD
+
+    /// Turn, distance left and ETA, sent every 2 s (or on change) while guiding on an Apple Maps route.
+    private func sendRideInfo() {
+        if Date().timeIntervalSince(weatherSentAt) > 60, let weatherPayload, bluetooth.sendInfo(weatherPayload) { weatherSentAt = Date() }
+        sendToday()
+        guard navigating, !externalGuidance, let route, let geometry else { return }
+        let total = geometry.cumulative.last ?? route.distance
+        let left = max(0, total - progress)
+        let next = steps.first { $0.end > progress + 3 }
+        let toTurn = max(0, (next?.end ?? total) - progress)
+        let eta = Date().addingTimeInterval(route.distance > 0 ? route.expectedTravelTime * left / route.distance : 0)
+        let parts = Calendar.current.dateComponents([.hour, .minute], from: eta)
+        let etaMinute = UInt16((parts.hour ?? 0) * 60 + (parts.minute ?? 0))
+        let text = next?.text ?? "Đến điểm đến"
+        let maneuver = next == nil ? 6 : Self.maneuver(text)
+        let key = "\(Int(toTurn / 10))|\(Int(left / 50))|\(etaMinute)|\(text)"
+        guard key != tripSentKey || Date().timeIntervalSince(tripSentAt) > 2 else { return }
+        var data = Data([1])
+        func u32(_ v: Double) { let x = UInt32(max(0, min(Double(UInt32.max), v.rounded()))); data.append(contentsOf: [UInt8(x & 255), UInt8(x >> 8 & 255), UInt8(x >> 16 & 255), UInt8(x >> 24)]) }
+        u32(left); u32(toTurn)
+        data.append(contentsOf: [UInt8(etaMinute & 255), UInt8(etaMinute >> 8), UInt8(maneuver)])
+        var clipped = ""
+        for ch in text { if clipped.utf8.count + String(ch).utf8.count > 140 { break }; clipped.append(ch) }
+        let bytes = Array(clipped.utf8)
+        data.append(contentsOf: bytes)
+        if bluetooth.sendInfo(data) { tripSentAt = Date(); tripSentKey = key }
+    }
+
+    nonisolated static func maneuver(_ instruction: String) -> Int {
+        let t = instruction.lowercased()
+        if t.contains("quay đầu") || t.contains("u-turn") || t.contains("make a u") { return 5 }
+        if t.contains("điểm đến") || t.contains("đích") || t.contains("arrive") || t.contains("destination") { return 6 }
+        let slight = t.contains("chếch") || t.contains("hơi") || t.contains("giữ") || t.contains("slight") || t.contains("keep")
+        if t.contains("trái") || t.contains("left") { return slight ? 3 : 1 }
+        if t.contains("phải") || t.contains("right") { return slight ? 4 : 2 }
+        return 0
+    }
+
+    private func refreshWeatherIfNeeded(_ fix: CLLocation) {
+        let moved = weatherLocation.map { fix.distance(from: $0) > 5000 } ?? true
+        guard !weatherLoading, moved || Date().timeIntervalSince(weatherFetchedAt) > 20 * 60 else { return }
+        weatherLoading = true
+        Task { await loadWeather(fix) }
+    }
+
+    /// Open-Meteo (free, no key): rain chance for the next 3 hours plus sunrise/sunset for HUD auto-brightness.
+    private func loadWeather(_ fix: CLLocation) async {
+        defer { weatherLoading = false }
+        let c = fix.coordinate
+        let url = URL(string: String(format: "https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f&current=temperature_2m,precipitation&hourly=precipitation_probability,precipitation&daily=sunrise,sunset&timezone=auto&forecast_days=2", c.latitude, c.longitude))!
+        struct Reply: Decodable {
+            struct Current: Decodable { let temperature_2m: Double; let precipitation: Double? }
+            struct Hourly: Decodable { let time: [String]; let precipitation_probability: [Int?]; let precipitation: [Double?] }
+            struct Daily: Decodable { let sunrise: [String]; let sunset: [String] }
+            let utc_offset_seconds: Int; let current: Current; let hourly: Hourly; let daily: Daily
+        }
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let reply = try? JSONDecoder().decode(Reply.self, from: data) else {
+            HUDDiagnostics.record("HUD weather: fetch failed"); return
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+        formatter.timeZone = TimeZone(secondsFromGMT: reply.utc_offset_seconds)
+        let now = Date()
+        var chance = 0, rainIn: Int? = nil
+        for (i, stamp) in reply.hourly.time.enumerated() {
+            guard let start = formatter.date(from: stamp) else { continue }
+            let end = start.addingTimeInterval(3600)
+            if end <= now || start > now.addingTimeInterval(3 * 3600) { continue }
+            let p = i < reply.hourly.precipitation_probability.count ? reply.hourly.precipitation_probability[i] ?? 0 : 0
+            let mm = i < reply.hourly.precipitation.count ? reply.hourly.precipitation[i] ?? 0 : 0
+            chance = max(chance, p)
+            if rainIn == nil && (p >= 40 || mm >= 0.3) { rainIn = max(0, Int(start.timeIntervalSince(now) / 60)) }
+        }
+        if (reply.current.precipitation ?? 0) >= 0.1 { rainIn = 0; chance = max(chance, 60) }
+        func minuteOfDay(_ s: String) -> UInt16 {
+            let hm = s.suffix(5).split(separator: ":").compactMap { Int($0) }
+            return hm.count == 2 ? UInt16(hm[0] * 60 + hm[1]) : 0xFFFF
+        }
+        let rise = reply.daily.sunrise.first.map(minuteOfDay) ?? 0xFFFF
+        let set = reply.daily.sunset.first.map(minuteOfDay) ?? 0xFFFF
+        let temp = Int16(max(-999, min(999, (reply.current.temperature_2m * 10).rounded())))
+        let wait = UInt16(rainIn.map { min($0, 0xFFFE) } ?? 0xFFFF)
+        var payload = Data([3, UInt8(min(100, chance))])
+        for v in [wait, UInt16(bitPattern: temp), rise, set, 0] { payload.append(contentsOf: [UInt8(v & 255), UInt8(v >> 8)]) }
+        weatherPayload = payload; weatherFetchedAt = now; weatherLocation = fix; weatherSentAt = .distantPast
+        rainLikely = rainIn != nil && chance >= 40
+        let degrees = Int((reply.current.temperature_2m).rounded())
+        if !rainLikely { rainForecast = "\(degrees)° · Không mưa trong 3 giờ tới" }
+        else if let rainIn, rainIn < 30 { rainForecast = "Đang/sắp mưa (\(chance)%)" }
+        else if let rainIn {
+            let hour = Calendar.current.component(.hour, from: now.addingTimeInterval(Double(rainIn) * 60))
+            rainForecast = "Mưa \(chance)% lúc \(hour)h"
+        }
+        HUDDiagnostics.record("HUD weather: chance=\(chance) rainIn=\(rainIn ?? -1) sunrise=\(rise) sunset=\(set)")
+        if bluetooth.sendInfo(payload) { weatherSentAt = Date() }
+    }
+
     func stop() {
         endHUDBackground()
         endHUDPreparationLocation()
@@ -614,6 +901,7 @@ import Combine
         locations.allowsBackgroundLocationUpdates = hudLocationActivity != nil
         status = "Đã dừng dẫn đường"; instruction = "Chưa bắt đầu dẫn đường"
         bluetooth.stopNavigation()
+        bluetooth.sendInfo(Data([2])); tripSentKey = ""
         publishHUDHistory()
     }
     private func renderIfNeeded() {
@@ -852,4 +1140,17 @@ private struct MapRenderJob: @unchecked Sendable {
     let externalGuidance: Bool
     let revision: Int
     let maxBytes: Int
+}
+
+struct ParkingSpot: Codable, Equatable {
+    let latitude: Double, longitude: Double, savedAt: Date
+    var coordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: latitude, longitude: longitude) }
+    var mapItem: MKMapItem {
+        let item = MKMapItem(placemark: MKPlacemark(coordinate: coordinate)); item.name = "Chỗ đỗ xe"; return item
+    }
+    static func load() -> ParkingSpot? {
+        UserDefaults.standard.data(forKey: "hudParking").flatMap { try? JSONDecoder().decode(ParkingSpot.self, from: $0) }
+    }
+    func save() { if let data = try? JSONEncoder().encode(self) { UserDefaults.standard.set(data, forKey: "hudParking") } }
+    static func clear() { UserDefaults.standard.removeObject(forKey: "hudParking") }
 }

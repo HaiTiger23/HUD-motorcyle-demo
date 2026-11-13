@@ -61,6 +61,10 @@ void lcdDmaSetMadctl(uint8_t value) {
     esp_lcd_panel_io_tx_param(io, 0x36, &value, 1);
 }
 
+void lcdDmaCommand(uint8_t command) {
+    if (io) esp_lcd_panel_io_tx_param(io, command, nullptr, 0);
+}
+
 void lcdDmaWait() {
     while (inflight.load() > 0) delay(1);
 }

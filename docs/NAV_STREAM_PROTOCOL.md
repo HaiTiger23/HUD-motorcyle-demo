@@ -11,6 +11,14 @@ hai byte UInt16 little endian đơn vị 0,1 km/h, giá trị 0..3000 hoặc 655
 có dữ liệu. Tách kênh để không làm rối trạng thái fragment/ACK ảnh. Board bỏ
 dữ liệu tốc độ cũ quá 5 giây; app có thể bỏ qua một mẫu khi BLE back-pressure.
 
+Tóm tắt chuyến trên kênh info `ee43a106-1b32-4d0f-9ab8-2248b0a01000` dùng
+`[1, remaining_m:u32LE, turn_m:u32LE, eta_minute:u16LE, maneuver:u8, instruction:UTF-8]`.
+Khi có lượt rẽ thứ hai hoặc đang chạy thử, app thêm
+`[NUL, flags:u8, next_maneuver:u8, gap_m:u16LE]` sau chuỗi chỉ dẫn. Bit 0 của
+`flags` đánh dấu chạy thử. `next_maneuver=255` nghĩa là chưa có lượt rẽ thứ
+hai. `gap_m` tính từ lượt rẽ thứ nhất. Firmware cũ dừng đọc chữ ở NUL, còn
+firmware mới vẫn nhận gói chuyến đi có chuỗi kết thúc theo chiều dài gói.
+
 Giữ nguyên quảng bá ANCS/AMS. App tìm `HUD iPhone` khi mở lần đầu ở foreground,
 sau đó lưu UUID CoreBluetooth để kết nối lại, không dựa vào quét mọi thiết bị nền.
 
@@ -22,13 +30,22 @@ Mỗi GATT write chứa một packet. Số nguyên là unsigned 32-bit little en
 | 2 | frame_id, offset, JPEG bytes | Without Response; tuân canSendWriteWithoutResponse |
 | 3 | frame_id | With Response; chờ ACK |
 | 5 | một byte: 0=tuyến HUD, 1=nền GPS kèm thông báo Google | With Response; trước packet 1 |
+| 7 | frame_id:u32LE, speed:u16LE (0,1 px/s), flags:u8, margin:u8, previous_frame:u32LE, advance:i16LE | With Response; trước packet 1 của khung cuộn |
 | 4 | không có payload | Dừng/xóa bản đồ |
 
 CRC32 là chuẩn IEEE, polynomial đảo `0xedb88320`, init/final XOR `0xffffffff`.
 Golden vector `123456789` cho `0xcbf43926`, được kiểm tra cả Swift và C++.
 Packet <= min(maximumWriteValueLength, 244); payload data tối đa packet_size−9.
-Ảnh baseline JPEG đúng 300×200, precision 8 bit, 1 hoặc 3 thành phần; tối đa 48 KiB.
-App và firmware phải cập nhật cùng nhau; bản app cũ gửi 300×150 sẽ bị từ chối.
+Ảnh baseline JPEG mặc định 320×240, precision 8 bit, 1 hoặc 3 thành phần; tối đa 48 KiB.
+Khung có op 7 cùng frame_id dùng JPEG rộng 320 px, cao 240 + 2 × margin px.
+Lề 12–64 px ở trên và dưới tùy tốc độ và độ phủ của ảnh Apple Maps. Bit 0 của
+flags chọn mũi tên thay cho chấm và bit 1 đánh dấu nền sáng. HUD vẽ dấu xe cố
+định và dịch ảnh tối đa đến mép lề hoặc 1,2 giây từ khi nhận op 7. Khi
+previous_frame khớp ảnh đang hiển thị, advance cho biết tâm ảnh cũ nằm thấp
+hơn tâm ảnh mới bao nhiêu pixel. HUD dùng độ lệch đó để giữ vị trí đường trên
+màn hình khi đổi JPEG và điều chỉnh dần theo tốc độ mới. previous_frame = 0
+bỏ qua bước căn chỉnh. Firmware vẫn nhận op 7 dài 8 byte kèm JPEG 344×264
+từ app cũ. App dùng lề thay đổi cần firmware mới.
 Không nhận ảnh quá kích thước hay Progressive JPEG. Nhận theo offset liên tục,
 không có đường giải mã ảnh khi thiếu fragment, sai CRC hoặc sai kích thước.
 

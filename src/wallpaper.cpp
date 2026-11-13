@@ -101,3 +101,11 @@ bool wallpaperStorage(size_t& used, size_t& total) {
     used = LittleFS.usedBytes(); total = LittleFS.totalBytes();
     return true;
 }
+size_t wallpaperReadJpeg(uint8_t* out, size_t capacity) {
+    if (!mounted || !LittleFS.exists(PATH)) return 0;
+    File file = LittleFS.open(PATH, "r");
+    const size_t size = file ? file.size() : 0;
+    const size_t got = size && size <= capacity ? file.read(out, size) : 0;
+    file.close();
+    return got == size ? size : 0;
+}

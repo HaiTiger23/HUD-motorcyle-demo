@@ -18,4 +18,5 @@ constexpr int TOUCH_SDA = 16;
 constexpr int TOUCH_INT = 17;
 constexpr int TOUCH_RST = 18;
 constexpr uint8_t TOUCH_I2C_ADDRESS = 0x38;
+constexpr int BAT_ADC = 9;
 }

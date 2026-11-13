@@ -43,7 +43,7 @@ void publish() {
     xSemaphoreGive(snapshotGuard);
     ++revision;
 }
-// Faces 0 Số lớn, 2 Kim hiện đại, 5 Kim cổ điển, 6 Đi xe, 8 iPhone (full-screen lock style).
+// Faces 0 Số lớn, 2 Kim hiện đại, 5 Kim cổ điển, 6 Đi xe, 8 iPhone (full-screen lock style), 9 Infograph.
 // Retired faces map onto their replacement: 1/3/4 -> 0 (big digits), 7 (speed dial) -> 6 (ride).
 // The colour/photo background is separate and applies to every face.
 uint8_t normalizeFace(uint8_t face) {
@@ -121,7 +121,7 @@ void hudSettingsBegin() {
         }
     }
     bool valid = state.version == 1 && state.count <= MAX_APPS && state.settings.theme < 8 &&
-        state.settings.face < 9 && validTimeout(state.settings.timeoutSeconds);
+        state.settings.face < 10 && validTimeout(state.settings.timeoutSeconds);
     if (valid) for (unsigned i = 0; i < state.count; ++i)
         valid = valid && state.apps[i].id[0] && memchr(state.apps[i].id, 0, sizeof(state.apps[i].id));
     if (valid && normalizeFace(state.settings.face) != state.settings.face) {
@@ -190,7 +190,7 @@ void hudSettingsTick() {
             reply[2]=aiVoiceTestSpeaker() ? 0 : 3;
         } else if (b[0] == 0x10 && request.size == 7) {
             const uint16_t seconds = b[4] | uint16_t(b[5]) << 8;
-            if (b[2] < 8 && b[3] < 9 && validTimeout(seconds) && b[6] < 2) {
+            if (b[2] < 8 && b[3] < 10 && validTimeout(seconds) && b[6] < 2) {
                 state.settings.theme = b[2]; state.settings.face = normalizeFace(b[3]);
                 state.settings.timeoutSeconds = seconds; state.settings.allowNewApps = b[6]; changed();
                 reply[2] = 0; memcpy(reply + 3, snapshot, 7); length = 10;
@@ -247,7 +247,7 @@ void hudSettingsTick() {
 const HudSettings& hudSettingsGet() { return state.settings; }
 const HudHardwareSettings& hudHardwareSettingsGet() { return hardware; }
 bool hudSettingsApply(const HudSettings& settings) {
-    if(settings.theme>=8 || settings.face>=9 || !validTimeout(settings.timeoutSeconds)) return false;
+    if(settings.theme>=8 || settings.face>=10 || !validTimeout(settings.timeoutSeconds)) return false;
     const HudSettings previous=state.settings;
     state.settings=settings; state.settings.face=normalizeFace(settings.face);
     if(!saveState()) {

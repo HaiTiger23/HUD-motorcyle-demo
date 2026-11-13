@@ -41,6 +41,13 @@ bool screenAwake = true;
 bool swallowWakeTouch = false;
 bool lastTouchDown=false;
 uint8_t displayRotation=0;
+enum class PanelPower { Awake, Asleep, Waking };
+PanelPower panelPower = PanelPower::Awake;
+uint32_t panelCommandAt = 0;
+uint32_t activeCpuMhz = 0;
+constexpr uint32_t PANEL_SLEEP_DELAY_MS = 120;
+constexpr uint32_t IDLE_CPU_MHZ = 80;
+
 void setBacklight(bool awake) {
     static int previous=-1;
 #ifdef HUD_DEMO_ONLY
@@ -51,33 +58,73 @@ void setBacklight(bool awake) {
     if(previous!=duty) { ledcWrite(2,duty); previous=duty; }
 }
 
+void panelCommand(uint8_t command) {
+    if (displayDma) lcdDmaCommand(command);
+    else tft.writecommand(command);
+}
+
+void servicePanelPower() {
+    const uint32_t now = millis();
+    auto* refresh = lv_display_get_refr_timer(display);
+    if (!screenAwake && panelPower == PanelPower::Awake) {
+        setBacklight(false);
+        lv_display_enable_invalidation(display, false);
+        lv_timer_pause(refresh);
+        if (displayDma) lcdDmaWait();
+        panelCommand(0x28); // Display off.
+        panelCommand(0x10); // Sleep in.
+        panelCommandAt = millis();
+        panelPower = PanelPower::Asleep;
+        if (activeCpuMhz > IDLE_CPU_MHZ) setCpuFrequencyMhz(IDLE_CPU_MHZ);
+    } else if (screenAwake && panelPower == PanelPower::Asleep) {
+        if (now - panelCommandAt < PANEL_SLEEP_DELAY_MS) return;
+        if (activeCpuMhz > IDLE_CPU_MHZ) setCpuFrequencyMhz(activeCpuMhz);
+        panelCommand(0x11); // Sleep out.
+        panelCommandAt = millis();
+        panelPower = PanelPower::Waking;
+    } else if (panelPower == PanelPower::Waking && now - panelCommandAt >= PANEL_SLEEP_DELAY_MS) {
+        panelCommand(0x29); // Display on.
+        lv_display_enable_invalidation(display, true);
+        lv_obj_invalidate(lv_screen_active());
+        lv_refr_now(display);
+        if (displayDma) lcdDmaWait();
+        panelPower = PanelPower::Awake;
+        setBacklight(true);
+    }
+}
+
+// Second contact for two-finger map gestures (valid while touchCount == 2).
+uint8_t touchCount = 0;
+uint16_t touch2X = 0, touch2Y = 0;
+
 bool readTouch(uint16_t& x, uint16_t& y) {
-    // FT6336 register 0x02 contains the number of contacts.  The first point
-    // starts at 0x03: XH, XL, YH, YL.  This is the same controller and mapping
-    // used by the manufacturer's LVGL sample.
+    // FT6336 register 0x02 contains the number of contacts. Point 1 is at 0x03
+    // (XH, XL, YH, YL), point 2 at 0x09. Same mapping as the manufacturer's sample.
     Wire.beginTransmission(board::TOUCH_I2C_ADDRESS);
     Wire.write(0x02);
     if (Wire.endTransmission(false) != 0 ||
-        Wire.requestFrom(board::TOUCH_I2C_ADDRESS, static_cast<uint8_t>(5)) != 5) {
+        Wire.requestFrom(board::TOUCH_I2C_ADDRESS, static_cast<uint8_t>(11)) != 11) {
+        touchCount = 0;
         return false;
     }
-
-    const uint8_t contacts = Wire.read() & 0x0f;
-    const uint8_t xh = Wire.read();
-    const uint8_t xl = Wire.read();
-    const uint8_t yh = Wire.read();
-    const uint8_t yl = Wire.read();
-    if (contacts == 0 || contacts > 2) {
-        return false;
-    }
-
-    const uint16_t rawX = static_cast<uint16_t>((xh & 0x0f) << 8) | xl;
-    const uint16_t rawY = static_cast<uint16_t>((yh & 0x0f) << 8) | yl;
-
-    // TFT_eSPI rotation 1: rotate the native 240 x 320 touch coordinates
-    // clockwise into the 320 x 240 HUD coordinate system.
-    const auto point=huddisplay::touch(rawX,rawY,displayRotation);
-    x=point.x; y=point.y;
+    uint8_t r[11];
+    for (auto& b : r) b = Wire.read();
+    const uint8_t contacts = r[0] & 0x0f;
+    if (contacts == 0 || contacts > 2) { touchCount = 0; return false; }
+    // Order the two contacts by their touch ID (YH bits 7-4) so a pinch's angle is stable.
+    int first = 1, second = 7;
+    if (contacts == 2 && (r[3] >> 4) > (r[9] >> 4)) std::swap(first, second);
+    auto map = [&](int at) {
+        const uint16_t rawX = static_cast<uint16_t>((r[at] & 0x0f) << 8) | r[at + 1];
+        const uint16_t rawY = static_cast<uint16_t>((r[at + 2] & 0x0f) << 8) | r[at + 3];
+        // TFT_eSPI rotation 1: rotate the native 240 x 320 touch coordinates
+        // clockwise into the 320 x 240 HUD coordinate system.
+        return huddisplay::touch(rawX, rawY, displayRotation);
+    };
+    const auto point = map(first);
+    x = point.x; y = point.y;
+    touchCount = contacts;
+    if (contacts == 2) { const auto p2 = map(second); touch2X = p2.x; touch2Y = p2.y; }
     return true;
 }
 
@@ -91,7 +138,6 @@ void readTouchInput(lv_indev_t*, lv_indev_data_t* data) {
         lastTouchAt = millis();
         if (!screenAwake) {
             screenAwake = true;
-            setBacklight(true);
             // The entire first contact only wakes the screen; it must not
             // activate a music button or tab hidden beneath the finger.
             swallowWakeTouch = true;
@@ -101,32 +147,28 @@ void readTouchInput(lv_indev_t*, lv_indev_data_t* data) {
         swallowWakeTouch = false;
     }
     bool consumed=false;
+    const bool waking = panelPower != PanelPower::Awake;
 #ifndef HUD_DEMO_ONLY
-    consumed=companionUiTouch(touching,x,y,swallowWakeTouch || wasWakeTouch);
+    consumed=companionUiTouch(touching,x,y,waking || swallowWakeTouch || wasWakeTouch,touching ? touchCount : 0,touch2X,touch2Y);
 #endif
-    data->state = touching && !swallowWakeTouch && !consumed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    data->state = touching && !waking && !swallowWakeTouch && !consumed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
     data->point.x = x;
     data->point.y = y;
 }
 
 void serviceDisplayTimeout() {
-    // Keep touch, LVGL and the BLE link running; only switch the backlight.
-    // If touch failed to initialize, leave the screen on so it remains usable.
+    // Keep touch and BLE running so they can wake the panel.
     const uint32_t timeout = hudSettingsGet().timeoutSeconds * 1000UL;
 #ifndef HUD_DEMO_ONLY
     // A live navigation page must remain readable without touching it while riding.
     if (companionUiNavigationActive() || aiVoiceBusy() || aiVoiceSpeakerBusy()) {
         lastTouchAt = millis();
-        if (!screenAwake) {
-            screenAwake = true;
-            setBacklight(true);
-        }
+        screenAwake = true;
     }
     if (companionUiConsumeWakeRequest()) {
         lastTouchAt = millis();
         if (!screenAwake) {
             screenAwake = true;
-            setBacklight(true);
             Serial.println("Display awake: notification");
         }
     }
@@ -135,10 +177,8 @@ void serviceDisplayTimeout() {
     if (previousTimeout != timeout) {
         previousTimeout = timeout;
         lastTouchAt = millis(); screenAwake = true;
-        setBacklight(true);
     }
     if (touchInput && screenAwake && timeout && uint32_t(millis() - lastTouchAt) >= timeout) {
-        setBacklight(false);
         screenAwake = false;
         Serial.printf("Display asleep: %us without touch\n", unsigned(timeout / 1000));
     }
@@ -185,10 +225,9 @@ void initDisplay() {
 }
 void serviceHardwareSettings() {
     const auto& hardware=hudHardwareSettingsGet();
-    setBacklight(screenAwake);
     static int previousVolume=-1;
     if(previousVolume!=hardware.speakerVolume && aiVoiceSetSpeakerVolume(hardware.speakerVolume)) previousVolume=hardware.speakerVolume;
-    if(displayRotation!=hardware.rotation && !lastTouchDown && !aiVoiceBusy()) {
+    if(displayRotation!=hardware.rotation && panelPower==PanelPower::Awake && !lastTouchDown && !aiVoiceBusy()) {
         displayRotation=hardware.rotation;
         if(displayDma) {
             // TFT_eSPI no longer owns the bus: rotate with MADCTL and repaint everything.
@@ -361,6 +400,24 @@ void cleanNvs() {
     printNvs();
 }
 
+bool displayBenchPending = false;
+
+void benchmarkDisplay() {
+    // Full-screen redraw cost (render + transfer), averaged over 20 frames.
+    uint32_t total = 0, worst = 0;
+    for (int i = 0; i < 20; ++i) {
+        lv_obj_invalidate(lv_screen_active());
+        const uint32_t start = micros();
+        lv_refr_now(display);
+        if (displayDma) lcdDmaWait();
+        const uint32_t us = micros() - start;
+        total += us;
+        worst = std::max(worst, us);
+    }
+    Serial.printf("BENCH full frame: avg=%ums worst=%ums (%.1f fps)\n", unsigned(total / 20000), unsigned(worst / 1000),
+                  20e6 / double(total));
+}
+
 void handleSerialCommands() {
     static char command[96];
     static size_t size = 0;
@@ -383,22 +440,17 @@ void handleSerialCommands() {
             companionUiPrintStatus();
             hudSettingsPrintStatus();
             aiVoicePrintStatus();
-            Serial.printf("Display idle: awake=%u; backlight=%u; idle_ms=%u; timeout_ms=%u\n",
+            Serial.printf("Display idle: awake=%u; backlight=%u; idle_ms=%u; timeout_ms=%u; panel=%s; cpu_mhz=%u\n",
                           screenAwake, ledcRead(2),
-                          uint32_t(millis() - lastTouchAt), hudSettingsGet().timeoutSeconds * 1000UL);
+                          uint32_t(millis() - lastTouchAt), hudSettingsGet().timeoutSeconds * 1000UL,
+                          panelPower==PanelPower::Asleep ? "asleep" : panelPower==PanelPower::Waking ? "waking" : "awake",
+                          unsigned(getCpuFrequencyMhz()));
+        } else if (strcmp(command, "JPEGBENCH") == 0) {
+            companionUiJpegBench();
         } else if (strcmp(command, "BENCH") == 0) {
-            // Full-screen redraw cost (render + transfer), averaged over 20 frames.
-            uint32_t total = 0, worst = 0;
-            for (int i = 0; i < 20; ++i) {
-                lv_obj_invalidate(lv_screen_active());
-                const uint32_t start = micros();
-                lv_refr_now(display);
-                if (displayDma) lcdDmaWait();
-                const uint32_t us = micros() - start;
-                total += us; worst = std::max(worst, us);
-            }
-            Serial.printf("BENCH full frame: avg=%ums worst=%ums (%.1f fps)\n", unsigned(total / 20000), unsigned(worst / 1000),
-                          20e6 / double(total));
+            lastTouchAt = millis();
+            screenAwake = true;
+            displayBenchPending = true;
         } else if (strcmp(command, "REFRESH") == 0) {
             const auto result = phoneLinkRefreshNotifications();
             Serial.printf("ANCS refresh request: %u (0=queued, 1=offline, 2=pairing, 3=busy)\n",
@@ -426,6 +478,7 @@ void handleSerialCommands() {
 void setup() {
     Serial.begin(115200);
     delay(200);
+    activeCpuMhz = getCpuFrequencyMhz();
     randomSeed(micros());
     wallpaperBegin(); // before settings: migrating the old wallpaper face writes its prefs
     hudSettingsBegin();
@@ -470,6 +523,7 @@ void loop() {
     PhoneEvent event;
     while (phoneLinkPoll(event)) companionUiHandle(event);
     handleSerialCommands();
+    batteryTick(now, ledcRead(2));
     companionUiTick();
 #endif
     const uint32_t frameStart = millis();
@@ -478,7 +532,19 @@ void loop() {
     const uint32_t frameMs = millis() - frameStart;
     if (frameMs >= 60) Serial.printf("LVGL slow frame: %ums\n", unsigned(frameMs));
     serviceDisplayTimeout();
-    static uint32_t backlightAt=0; // follows the day/night ramp; setBacklight skips unchanged duty
-    if(now-backlightAt>=1000) { backlightAt=now; setBacklight(screenAwake); }
-    delay(5);
+    servicePanelPower();
+    if (panelPower == PanelPower::Awake) {
+        if (displayBenchPending) {
+            displayBenchPending = false;
+            benchmarkDisplay();
+        }
+        static uint32_t backlightAt=0, backlightRevision=UINT32_MAX;
+        const uint32_t revision = hudSettingsRevision();
+        if (now-backlightAt>=1000 || revision!=backlightRevision) {
+            backlightAt=now;
+            backlightRevision=revision;
+            setBacklight(true);
+        }
+    }
+    delay(panelPower==PanelPower::Asleep && !screenAwake ? 20 : 5);
 }

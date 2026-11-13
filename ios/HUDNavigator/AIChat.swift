@@ -137,7 +137,7 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
     Lệnh không có value: music_play, music_pause, music_next, music_previous, volume_up, volume_down (âm lượng một bước, không đặt phần trăm), music_status.
     Thông báo HUD đã nhận: notifications_count (đếm), notifications_latest (đọc mới nhất), notifications_list (liệt kê ba mục mới nhất), notifications_summary (tóm tắt ba mục mới nhất). Không có dữ liệu toàn bộ iPhone hay trạng thái đã đọc/chưa đọc. App có thể tự đọc câu trả lời qua loa HUD nếu người dùng bật giọng đọc.
     Lệnh có value: set_theme=0 Đại dương/tối xanh,1 Rừng xanh,2 Hoàng hôn,3 Anh đào,4 Trắng xanh/nền sáng,5 Bạc hà,6 Kem,7 Hồng sáng.
-    set_face=0 Số lớn,2 Kim hiện đại,5 Kim cổ điển,6 Đi xe (tốc độ),8 iPhone (toàn màn hình).
+    set_face=0 Số lớn,2 Kim hiện đại,5 Kim cổ điển,6 Đi xe (tốc độ),8 iPhone (toàn màn hình),9 Infograph (nhiều thông tin).
     set_timeout=15,30,60,120,300 giây hoặc 0 luôn sáng. Không dùng 0 để tắt màn hình.
     show_page=0 Đồng hồ,1 Thông báo,2 Bản đồ,3 Nhạc. Đây chỉ mở trang, không bắt đầu tuyến đường.
     Khi người dùng muốn tìm/chỉ đường đến một địa điểm cụ thể, trả {"action":"navigate_to","query":"tên địa điểm"}. Chỉ dùng tên/loại địa điểm trong câu nói; MapKit sẽ tìm kết quả thật và HUD luôn yêu cầu người dùng chọn, xem tuyến, rồi bấm bắt đầu.
@@ -471,6 +471,8 @@ private final class RouterRedirectGuard: NSObject, URLSessionTaskDelegate {
         HUDDiagnostics.record("HUD AI speech: segment=\(id)")
         let segment=SpeechSegment(recognizer)
         segment.request.shouldReportPartialResults=true; segment.request.taskHint = .dictation
+        // Server recognition: forcing the on-device model in the background stalled
+        // Vietnamese requests (no result, no error) on this iPhone.
         segment.request.requiresOnDeviceRecognition=false
         segments[id]=segment
         segment.task=recognizer.recognitionTask(with:segment.request) { [weak self] result,error in

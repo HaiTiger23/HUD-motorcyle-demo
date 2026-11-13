@@ -11,6 +11,9 @@ for mtu in [20, 64, 244, 512] {
 }
 precondition(HUDWire.packets(jpeg: Data(), id: 1, maxWrite: 244) == nil)
 precondition(HUDWire.packets(jpeg: Data(count: 50000), id: 1, maxWrite: 244) == nil)
+precondition(HUDWire.motionHeader(id: 0x12345678, pixelsPerSecond: 300, marker: .arrow, light: true,
+    margin: 48, previousFrame: 0x12345677, advance: -20)
+    == Data([7,0x78,0x56,0x34,0x12,0x2c,1,3,48,0x77,0x56,0x34,0x12,0xec,0xff]))
 let start = GeoPoint(10.0, 106.0), end = GeoPoint(10.001, 106.0)
 let route = RouteProgress(points: [start, end, GeoPoint(10.001, 106.001)])
 let halfway = route.project(GeoPoint(10.0005, 106.00001))!
@@ -18,6 +21,33 @@ precondition(abs(halfway.metres - 55.6) < 1 && halfway.error < 2 && halfway.segm
 precondition(route.project(GeoPoint(10.002, 106))!.error > 100)
 precondition(RouteProgress(points: []).project(start) == nil)
 print("Swift CRC32, BLE fragmentation and route projection checks passed")
+let replayRoute = RouteProgress(points: [start, start, end, GeoPoint(10.001, 106.001), GeoPoint(10.001, 106.001)])
+let departure = replayRoute.sample(at: -1)!
+precondition(departure.segment == 1 && abs(departure.course) < 0.01)
+let bend = replayRoute.sample(at: replayRoute.cumulative[2])!
+precondition(bend.segment == 2 && abs(bend.course - 90) < 0.01)
+let finish = replayRoute.sample(at: 10000)!
+precondition(finish.segment == 2 && abs(finish.point.longitude - 106.001) < 0.000001)
+precondition(RouteProgress(points: [start, start]).sample(at: 0) == nil)
+let steps = [
+    HUDRouteStep(end: 300, text: "Rẽ phải", maneuver: 2),
+    HUDRouteStep(end: 310, text: "Đi thẳng", maneuver: 0),
+    HUDRouteStep(end: 330, text: "Rẽ trái", maneuver: 1),
+    HUDRouteStep(end: 350, text: "Đến nơi", maneuver: 6)
+]
+precondition(HUDRouteStep.upcoming(in: steps, progress: 49).following == nil)
+let turns = HUDRouteStep.upcoming(in: steps, progress: 220)
+precondition(turns.first?.maneuver == 2 && turns.following?.maneuver == 1 && turns.following?.metresAfter == 30)
+precondition(HUDRouteStep.upcoming(in: steps, progress: 301).following == nil)
+precondition(HUDRouteStep.upcoming(in: steps, progress: 325).following == nil)
+let legacyTrip = HUDWire.trip(remaining: 345, toTurn: 80, etaMinute: 540, maneuver: 2,
+    instruction: "Rẽ phải", following: nil, simulating: false, maxWrite: 244)!
+precondition(String(data: legacyTrip.dropFirst(12), encoding: .utf8) == "Rẽ phải")
+let replayTrip = HUDWire.trip(remaining: 345, toTurn: 80, etaMinute: 540, maneuver: 2,
+    instruction: "Rẽ phải", following: turns.following, simulating: true, maxWrite: 20)!
+precondition(replayTrip.count <= 20 && String(data: replayTrip[12..<13], encoding: .utf8) == "R")
+precondition(replayTrip.suffix(5) == Data([0, 1, 1, 30, 0]))
+print("Route replay and consecutive turns: interpolation, cue thresholds and compatible trip encoding passed")
 let apple = MapShare.place(from: URL(string: "https://maps.apple.com/?ll=10.77,106.69&q=Test")!)!
 precondition(apple.latitude == 10.77 && apple.longitude == 106.69)
 let google = MapShare.place(from: URL(string: "https://www.google.com/maps/place/Test/@1,2,15z/data=!3d10.78!4d106.70")!)!
@@ -66,7 +96,9 @@ precondition(pan.command == .pan && pan.frameID == 0x12345678 && pan.dx == -50 &
 precondition(HUDMapControl(Data([0x80,1,1,0,0,0,0,0,0,0]))?.command == .zoomIn)
 precondition(HUDMapControl(Data([0x80,3,1,0,0,0,0,0,0,0]))?.command == .follow)
 precondition(HUDMapControl(Data([0x80,1,1,0,0,0,1,0,0,0])) == nil)
-precondition(HUDMapControl(Data([0x80,4,1,0,0,0,0x2d,1,0,0])) == nil)
+precondition(HUDMapControl(Data([0x80,4,1,0,0,0,0x40,1,240,0]))?.dx == 320)
+precondition(HUDMapControl(Data([0x80,4,1,0,0,0,0x41,1,0,0])) == nil)
+precondition(HUDMapControl(Data([0x80,4,1,0,0,0,0,0,241,0])) == nil)
 precondition(HUDMapControl(Data([0x80,6,1,0,0,0,0,0,0,0]))?.command == .stop)
 precondition(HUDMapControl(Data([0x80,6,1,0,0,0,1,0,0,0])) == nil)
 precondition(HUDMapControl(Data([0x80,7,1,0,0,0,0,0,0,0])) == nil)
@@ -112,7 +144,7 @@ for invalid in ["{\"action\":\"delete_all\"}","{\"action\":\"set_theme\"}","{\"a
 }
 precondition(HUDAssistantAction.make("set_timeout",value:0)?.value==0)
 precondition(HUDAssistantAction.make("set_face",value:8)?.value==8)
-precondition(HUDAssistantAction.make("set_face",value:9)==nil)
+precondition(HUDAssistantAction.make("set_face",value:10)==nil)
 var toolAssembly=HUDToolAssembly(id:1)
 let split=Array("ẽ".utf8)
 let partialTool=try toolAssembly.feed(Data([0xB0,1,0,0,0,0,0,0,0,split[0]]))

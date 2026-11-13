@@ -16,7 +16,7 @@ public struct HUDAssistantAction: Equatable {
         let code: UInt8
         switch name {
         case "set_theme": guard (0..<8).contains(value) else { return nil }; code=4
-        case "set_face": guard (0..<9).contains(value) else { return nil }; code=5
+        case "set_face": guard (0..<10).contains(value) else { return nil }; code=5
         case "set_timeout": guard [0,15,30,60,120,300].contains(value) else { return nil }; code=6
         case "show_page": guard (0..<4).contains(value) else { return nil }; code=7
         default: return nil
@@ -134,7 +134,8 @@ public enum HUDMapCadence {
 }
 
 public struct HUDMapControl {
-    public enum Command: UInt8 { case zoomIn = 1, zoomOut = 2, follow = 3, pan = 4, browse = 5, stop = 6 }
+    /// transform: dx = scale in percent (pinch), dy = rotation in degrees (clockwise on screen).
+    public enum Command: UInt8 { case zoomIn = 1, zoomOut = 2, follow = 3, pan = 4, browse = 5, stop = 6, transform = 7 }
     public let command: Command
     public let frameID: UInt32
     public let dx: Int
@@ -144,7 +145,8 @@ public struct HUDMapControl {
         let x = Int(Int16(bitPattern: UInt16(data[6]) | UInt16(data[7]) << 8))
         let y = Int(Int16(bitPattern: UInt16(data[8]) | UInt16(data[9]) << 8))
         guard abs(x) <= HUDWire.imageWidth, abs(y) <= HUDWire.imageHeight,
-              command == .pan || (x == 0 && y == 0) else { return nil }
+              command == .pan || command == .transform || (x == 0 && y == 0) else { return nil }
+        if command == .transform, !(25...320).contains(x) || abs(y) > 180 { return nil }
         self.command = command; dx = x; dy = y
         frameID = (0..<4).reduce(UInt32(0)) { $0 | UInt32(data[$1 + 2]) << ($1 * 8) }
     }
@@ -160,13 +162,45 @@ public struct HUDMapControl {
 }
 
 public enum HUDWire {
+    public static func trip(remaining: UInt32, toTurn: UInt32, etaMinute: UInt16, maneuver: UInt8,
+                            instruction: String, following: HUDFollowingTurn?, simulating: Bool,
+                            maxWrite: Int) -> Data? {
+        let trailer = following != nil || simulating
+        let textLimit = min(140, maxWrite - 12 - (trailer ? 5 : 0))
+        guard textLimit >= 0 else { return nil }
+        var data = Data([1]) + word(remaining) + word(toTurn)
+        data.append(contentsOf: [UInt8(truncatingIfNeeded: etaMinute), UInt8(etaMinute >> 8), maneuver])
+        let text = instruction.prefix { $0 != "\0" }
+        data.append(contentsOf: HUDVoiceWire.bounded(String(text), bytes: textLimit).utf8)
+        if trailer {
+            // The NUL keeps the instruction readable on firmware that only knows packet 1.
+            let gap = following?.metresAfter ?? 0
+            data.append(contentsOf: [0, simulating ? 1 : 0, following?.maneuver ?? 255,
+                                     UInt8(truncatingIfNeeded: gap), UInt8(gap >> 8)])
+        }
+        return data
+    }
+
     public static func speedKmh(metresPerSecond: Double, accuracy: Double, speedAccuracy: Double, age: Double) -> Double? {
         guard metresPerSecond.isFinite, metresPerSecond >= 0, metresPerSecond <= 300/3.6,
               accuracy >= 0, accuracy <= 25, speedAccuracy >= 0, speedAccuracy <= 3, abs(age) <= 5 else { return nil }
         return metresPerSecond < 0.5 ? 0 : metresPerSecond*3.6
     }
-    public static let imageWidth = 300
-    public static let imageHeight = 200
+    // Full-screen HUD map frames (the HUD draws the turn card and info bar itself).
+    public static let imageWidth = 320
+    public static let imageHeight = 240
+    public static let minMotionMargin = 12
+    public static let maxMotionMargin = 64
+    public static func motionHeader(id: UInt32, pixelsPerSecond: UInt16, marker: HUDLocationMarker, light: Bool,
+                                    margin: UInt8, previousFrame: UInt32, advance: Int16) -> Data {
+        let flags: UInt8 = (marker == .arrow ? 1 : 0) | (light ? 2 : 0)
+        let displacement = UInt16(bitPattern: advance)
+        var data = Data([7]) + word(id)
+        data.append(contentsOf: [UInt8(truncatingIfNeeded: pixelsPerSecond), UInt8(pixelsPerSecond >> 8), flags, margin])
+        data.append(word(previousFrame))
+        data.append(contentsOf: [UInt8(truncatingIfNeeded: displacement), UInt8(displacement >> 8)])
+        return data
+    }
     public static let maxImage = 48 * 1024
     public static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xffff_ffff
@@ -308,6 +342,39 @@ public struct GeoPoint: Equatable {
         return 6_371_000 * 2 * atan2(sqrt(a), sqrt(max(0, 1 - a)))
     }
 }
+
+public struct HUDFollowingTurn: Equatable {
+    public let maneuver: UInt8
+    public let metresAfter: UInt16
+}
+
+public struct HUDRouteStep {
+    public let end: Double
+    public let text: String
+    public let maneuver: UInt8
+
+    public init(end: Double, text: String, maneuver: UInt8) {
+        self.end = end; self.text = text; self.maneuver = maneuver
+    }
+
+    private var isTurn: Bool { (1...5).contains(maneuver) || (7...16).contains(maneuver) }
+
+    public static func upcoming(in steps: [HUDRouteStep], progress: Double)
+        -> (first: HUDRouteStep?, following: HUDFollowingTurn?) {
+        guard let index = steps.firstIndex(where: { $0.end > progress + 3 }) else { return (nil, nil) }
+        let first = steps[index]
+        guard first.isTurn, first.end - progress <= 250 else { return (first, nil) }
+        for step in steps.dropFirst(index + 1) {
+            let gap = step.end - first.end
+            if gap > 100 || step.maneuver == 6 || step.maneuver == 17 { break }
+            if gap.rounded() >= 4, step.isTurn {
+                return (first, HUDFollowingTurn(maneuver: step.maneuver, metresAfter: UInt16(gap.rounded())))
+            }
+        }
+        return (first, nil)
+    }
+}
+
 public struct RouteProgress {
     public let points: [GeoPoint]
     public let cumulative: [Double]
@@ -317,6 +384,29 @@ public struct RouteProgress {
         if points.count > 1 { for i in 1..<points.count { lengths[i] = lengths[i - 1] + points[i - 1].distance(to: points[i]) } }
         cumulative = lengths
     }
+
+    /// Interpolate along the route by travelled distance, including at loops and crossings.
+    public func sample(at metres: Double) -> (point: GeoPoint, segment: Int, course: Double)? {
+        guard metres.isFinite, let total = cumulative.last, total.isFinite, total > 0 else { return nil }
+        let distance = min(total, max(0, metres))
+        // At a vertex use the outgoing segment. At the finish use the last moving segment.
+        let target = min(distance, total.nextDown)
+        var low = 1, high = cumulative.count - 1
+        while low < high {
+            let middle = (low + high) / 2
+            if cumulative[middle] <= target { low = middle + 1 } else { high = middle }
+        }
+        let segment = low - 1
+        let a = points[segment], b = points[low]
+        let fraction = (distance - cumulative[segment]) / (cumulative[low] - cumulative[segment])
+        let deltaLon = (b.longitude - a.longitude + 540).truncatingRemainder(dividingBy: 360) - 180
+        let lon = (a.longitude + fraction * deltaLon + 540).truncatingRemainder(dividingBy: 360) - 180
+        let p1 = a.latitude * .pi / 180, p2 = b.latitude * .pi / 180, dl = deltaLon * .pi / 180
+        let heading = atan2(sin(dl) * cos(p2), cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl))
+        let course = (heading * 180 / .pi + 360).truncatingRemainder(dividingBy: 360)
+        return (GeoPoint(a.latitude + fraction * (b.latitude - a.latitude), lon), segment, course)
+    }
+
     public func project(_ location: GeoPoint, startingAt segment: Int = 0) -> (metres: Double, error: Double, segment: Int)? {
         guard points.count > 1 else { return nil }
         let rad = Double.pi / 180, scale = 6_371_000 * Double.pi / 180

@@ -18,3 +18,5 @@ bool wallpaperBackground();
 void wallpaperSetBackground(bool photo);
 // LittleFS usage for the device-info screen; false when the partition is not mounted.
 bool wallpaperStorage(size_t& used, size_t& total);
+// Copies the stored wallpaper JPEG (for benchmarks); returns its size or 0.
+size_t wallpaperReadJpeg(uint8_t* out, size_t capacity);

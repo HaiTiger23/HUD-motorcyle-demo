@@ -7,10 +7,12 @@ import Combine
 @MainActor enum HUDDiagnostics {
     static func record(_ message: String) {
         print(message)
+        // Settings sync chatter would push a whole ride out of the log; keep it on the console only.
+        if message.hasPrefix("HUD settings:") || message.hasPrefix("HUD incoming:") { return }
         guard let cache=FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask).first else { return }
         let url=cache.appendingPathComponent("HUDRuntime.log")
         var data=Data()
-        if let previous=try? Data(contentsOf:url) { data.append(contentsOf:previous.suffix(24000)) }
+        if let previous=try? Data(contentsOf:url) { data.append(contentsOf:previous.suffix(300_000)) }
         data.append(Data("\(Date().ISO8601Format()) \(message)\n".utf8))
         try? data.write(to:url,options:[.atomic,.completeFileProtectionUntilFirstUserAuthentication])
     }
@@ -85,6 +87,7 @@ struct HUDAppRule: Identifiable {
     @Published var wallpaperBackground: Bool?
     @Published var wallpaperStatus = ""
     private var wallpaperTransfer = false
+    private var mapStats: (frames: Int, bytes: Int, bleMs: Int, rejected: Int, since: Date) = (0, 0, 0, 0, Date())
     /// Called when the HUD link drops on its own (out of range, HUD off), not when the app disconnects.
     var onLinkLost: (() -> Void)?
     @Published var apps: [HUDAppRule] = []
@@ -379,13 +382,17 @@ struct HUDAppRule: Identifiable {
     @discardableResult func sendWallpaper(_ jpeg: Data) -> Bool {
         send(jpeg: jpeg, wallpaper: true) != nil
     }
-    @discardableResult func send(jpeg: Data, externalGuidance: Bool = false, wallpaper: Bool = false) -> UInt32? {
+    @discardableResult func send(jpeg: Data, externalGuidance: Bool = false, wallpaper: Bool = false,
+                                 motion: MapFrameMotion? = nil) -> UInt32? {
         guard ready, !busy, let device, rx != nil else { return nil }
         frameID &+= 1
         guard let newPackets = HUDWire.packets(jpeg: jpeg, id: frameID,
             maxWrite: device.maximumWriteValueLength(for: .withoutResponse)) else { status = "Khung bản đồ quá lớn"; return nil }
         wallpaperTransfer = wallpaper
-        packets = [wallpaper ? Data([6]) : Data([5, externalGuidance ? 1 : 0])] + newPackets; packetIndex = 0; busy = true
+        let mode = motion.map { HUDWire.motionHeader(id: frameID, pixelsPerSecond: $0.speed, marker: $0.marker,
+            light: $0.light, margin: $0.margin, previousFrame: $0.previousFrame, advance: $0.advance) }
+            ?? (wallpaper ? Data([6]) : Data([5, externalGuidance ? 1 : 0]))
+        packets = [mode] + newPackets; packetIndex = 0; busy = true
         frameAcknowledged = false; transferStarted = Date(); transferBytes = jpeg.count
         timeout = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in
             Task { @MainActor in
@@ -398,15 +405,18 @@ struct HUDAppRule: Identifiable {
         pump()
         return frameID
     }
-    func sendSpeed(_ kmh: Double?) {
-        guard ready, let device, let speedChannel, device.canSendWriteWithoutResponse else { return }
+    @discardableResult func sendSpeed(_ kmh: Double?) -> Bool {
+        guard ready, let device, let speedChannel, device.canSendWriteWithoutResponse else { return false }
         let value: UInt16 = kmh.map { UInt16(max(0, min(3000, ($0*10).rounded()))) } ?? 65535
         device.writeValue(Data([UInt8(value & 255), UInt8(value >> 8)]), for: speedChannel, type: .withoutResponse)
+        return true
     }
     /// Trip/weather summary (firmware characteristic ee43a106). Small and resent
     /// periodically, so an occasional dropped write is harmless.
+    var infoPayloadLimit: Int { device?.maximumWriteValueLength(for: .withoutResponse) ?? 0 }
     @discardableResult func sendInfo(_ payload: Data) -> Bool {
-        guard ready, let device, let infoChannel, device.canSendWriteWithoutResponse else { return false }
+        guard ready, let device, let infoChannel, device.canSendWriteWithoutResponse,
+              payload.count <= infoPayloadLimit else { return false }
         device.writeValue(payload, for: infoChannel, type: .withoutResponse)
         return true
     }
@@ -414,7 +424,7 @@ struct HUDAppRule: Identifiable {
         guard !waitingWrite, let device, let rx else { return }
         while packetIndex < packets.count {
             let packet = packets[packetIndex]
-            if packet.first == 1 || packet.first == 3 || packet.first == 5 || packet.first == 6 {
+            if packet.first == 1 || packet.first == 3 || packet.first == 5 || packet.first == 6 || packet.first == 7 {
                 waitingWrite = true; packetIndex += 1
                 device.writeValue(packet, for: rx, type: .withResponse)
                 return
@@ -473,7 +483,18 @@ struct HUDAppRule: Identifiable {
             if data[0] == 0 { wallpaperHasImage = true; wallpaperBackground = true }
         } else { status = data[0] == 0 ? "HUD đã nhận bản đồ" : "HUD từ chối khung bản đồ" }
         frameAcknowledged = true
-        print("HUD map: bytes=\(transferBytes), bleMs=\(Int(Date().timeIntervalSince(transferStarted) * 1000)), accepted=\(data[0] == 0)")
+        let bleMs = Int(Date().timeIntervalSince(transferStarted) * 1000)
+        print("HUD map: bytes=\(transferBytes), bleMs=\(bleMs), accepted=\(data[0] == 0)")
+        // Rolling map throughput for the runtime log (one line per 30 frames).
+        if mapStats.frames == 0 { mapStats.since = transferStarted }
+        mapStats.frames += 1; mapStats.bytes += transferBytes; mapStats.bleMs += bleMs
+        if data[0] != 0 { mapStats.rejected += 1 }
+        if mapStats.frames >= 30 {
+            let seconds = max(0.001, Date().timeIntervalSince(mapStats.since))
+            HUDDiagnostics.record(String(format: "HUD map stats: fps=%.1f avgBytes=%d avgBleMs=%d rejected=%d",
+                Double(mapStats.frames) / seconds, mapStats.bytes / mapStats.frames, mapStats.bleMs / mapStats.frames, mapStats.rejected))
+            mapStats = (0, 0, 0, 0, Date())
+        }
         finishTransferIfAcknowledged()
     }
     private func finishTransferIfAcknowledged() {
@@ -589,7 +610,7 @@ struct HUDAppRule: Identifiable {
         }
     }
     private func decodeSettings(_ data: Data) -> Bool {
-        guard data.count == 7, data[0] == 1, data[1] < 8, data[2] < 9,
+        guard data.count == 7, data[0] == 1, data[1] < 8, data[2] < 10,
               [0,15,30,60,120,300].contains(Int(data[3]) | Int(data[4]) << 8), data[5] < 2, data[6] <= 24 else { return false }
         let value = HUDSettings(theme: Int(data[1]), face: Int(data[2]),
             timeout: Int(data[3]) | Int(data[4]) << 8, allowNewApps: data[5] == 1)

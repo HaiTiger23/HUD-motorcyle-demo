@@ -9,6 +9,11 @@ import UserNotifications
     @Published var results: [MKMapItem] = []
     @Published var status = "Cho phép vị trí để tìm đường"
     @Published var navigating = false
+    @Published private(set) var simulating = false
+    @Published private(set) var simulationFinished = false
+    @Published private(set) var simulationCoordinate: CLLocationCoordinate2D?
+    @Published var simulationRate = 1
+    @Published private(set) var followingTurn: HUDFollowingTurn?
     @Published var preview: UIImage?
     @Published var instruction = "Chưa bắt đầu dẫn đường"
     @Published var transport = "Ô tô"
@@ -16,21 +21,34 @@ import UserNotifications
     @Published var backgroundGPS=UserDefaults.standard.object(forKey:"hudBackgroundGPS") as? Bool ?? true
     private var hudLocationActivity: CLBackgroundActivitySession?
     private var hudGPSWaitTimer: Timer?
+    /// iOS location permission is "Always": GPS may be started from the background, e.g. when
+    /// a route is started by voice on the HUD while the iPhone is locked.
+    @Published var locationAlways = false
+
+    /// Keep a Core Location background activity while the connected HUD needs to start a
+    /// search or route with the iPhone locked.  iOS requires that this session is created
+    /// while the app is foregrounded; it then keeps GPS/MapKit available after lock.
     func updateHUDLocationActivity() {
-        let authorized=locations.authorizationStatus == .authorizedAlways || locations.authorizationStatus == .authorizedWhenInUse
+        let authorization=locations.authorizationStatus
+        let authorized=authorization == .authorizedAlways || authorization == .authorizedWhenInUse
+        locationAlways=authorization == .authorizedAlways
         if backgroundGPS && bluetooth.ready && authorized {
             if hudLocationActivity == nil && UIApplication.shared.applicationState == .active {
                 hudLocationActivity=CLBackgroundActivitySession()
                 HUDDiagnostics.record("HUD location activity: started in foreground")
             }
-        } else {
+        } else if hudLocationActivity != nil {
             hudLocationActivity?.invalidate(); hudLocationActivity=nil
             HUDDiagnostics.record("HUD location activity: stopped")
         }
-        locations.allowsBackgroundLocationUpdates=navigating || preparing || hudLocationActivity != nil
-        locations.showsBackgroundLocationIndicator=locations.allowsBackgroundLocationUpdates
+        locations.desiredAccuracy=kCLLocationAccuracyBestForNavigation
+        locations.distanceFilter=kCLDistanceFilterNone
+        let needsBackgroundLocation=navigating || preparing || waitingToStart || hudSearchSession != nil || hudLocationActivity != nil
+        locations.allowsBackgroundLocationUpdates=needsBackgroundLocation
+        locations.showsBackgroundLocationIndicator=needsBackgroundLocation
         if authorized { locations.startUpdatingLocation() }
     }
+
     func saveBackgroundGPS() {
         UserDefaults.standard.set(backgroundGPS,forKey:"hudBackgroundGPS")
         updateHUDLocationActivity()
@@ -60,6 +78,16 @@ import UserNotifications
     @Published var rainForecast = ""
     @Published var rainLikely = false
     private var weatherPayload: Data?
+    private var sunriseMinute = 6 * 60, sunsetMinute = 18 * 60   // updated from the weather feed
+
+    /// Light map only for a light HUD theme on a colour background during the day; a photo
+    /// background (dark UI on the HUD) or night gives a dark map so it matches the screen.
+    private func mapUsesLightStyle() -> Bool {
+        guard bluetooth.settings.theme >= 4, bluetooth.wallpaperBackground != true else { return false }
+        let now = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let minute = (now.hour ?? 12) * 60 + (now.minute ?? 0)
+        return minute >= sunriseMinute && minute < sunsetMinute
+    }
     private var weatherFetchedAt = Date.distantPast
     private var weatherLocation: CLLocation?
     private var weatherLoading = false
@@ -136,10 +164,17 @@ import UserNotifications
     let bluetooth: BluetoothLink
     private let locations = CLLocationManager()
     private var latest: CLLocation?
+    private var simulationFix: CLLocation?
+    private var simulationTickAt: TimeInterval = 0
+    private var simulationSpeedSentAt: TimeInterval = 0
+    private static let simulationSpeed = 10.0  // 36 km/h at 1×
+    var canSimulate: Bool { (geometry?.cumulative.last ?? 0) > 0 }
     private var destination: MKMapItem?
     private var route: MKRoute?
     private var geometry: RouteProgress?
-    private var steps: [(end: Double, text: String)] = []
+    private var steps: [HUDRouteStep] = []
+    /// Maneuver code of the upcoming step (see `Maneuver`), for the app banner.
+    @Published var currentManeuver = 0
     private var segment = 0
     private var progress = 0.0
     private var lastRender = Date.distantPast
@@ -150,11 +185,12 @@ import UserNotifications
     private var directions: MKDirections?
     private var search: MKLocalSearch?
     private var snapshotter: MKMapSnapshotter?
-    private var cachedSnapshot: MKMapSnapshotter.Snapshot?
+    private var tileTask: Task<Void, Never>?
+    private var mapRequest: UUID?
+    private var cachedBase: HUDMapBase?
+    private var lastAppleBase: HUDMapBase?
     private var cachedRoutePath: CGPath?
     private var snapshotLocation: CLLocation?
-    private var snapshotHeading = 0.0
-    private var snapshotLight = false
     private var snapshotAt = Date.distantPast
     private var snapshotAttemptAt = Date.distantPast
     private var baseVersion = 0
@@ -165,18 +201,18 @@ import UserNotifications
     private var browseCenter: CLLocationCoordinate2D?
     private var browseHeading = 0.0
     private var cameraEpoch = 0
-    private var snapshotEpoch = -1
     private var sentCameraEpoch = -1
-    private var snapshotCenter = CLLocationCoordinate2D()
     private var markerState = HUDLocationMarkerState()
     private var renderedMarker: HUDLocationMarker = .dot
     private var sentMarker: HUDLocationMarker = .dot
     private var latestSpeed: Double?
     private struct FrameContext {
         let id: UInt32
-        let snapshot: MKMapSnapshotter.Snapshot
+        let base: HUDMapBase
         let center: CLLocationCoordinate2D
         let heading: Double
+        let scale: Double
+        let hasMotion: Bool
     }
     private var frameContexts: [FrameContext] = []
     private var connectionObserver: AnyCancellable?
@@ -190,11 +226,12 @@ import UserNotifications
     private var hudSelectionFromAI=false
     private var hudBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var hudBackgroundEpoch=UUID()
+    private var mapSnapshotBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var hudPreparationTimer: Timer?
     private func endHUDPreparationLocation() {
         hudPreparationTimer?.invalidate(); hudPreparationTimer=nil
         hudGPSWaitTimer?.invalidate(); hudGPSWaitTimer=nil
-        if !navigating { locations.allowsBackgroundLocationUpdates=hudLocationActivity != nil }
+        updateHUDLocationActivity()   // single place that decides GPS on/off
     }
     func finishHUDBackgroundIfIdle() {
         finishHistoryDelivery()
@@ -207,6 +244,22 @@ import UserNotifications
         let task=hudBackgroundTask; hudBackgroundTask = .invalid
         UIApplication.shared.endBackgroundTask(task)
         HUDDiagnostics.record("HUD navigation background: ended")
+    }
+    private func endMapSnapshotBackground() {
+        guard mapSnapshotBackgroundTask != .invalid else { return }
+        let task = mapSnapshotBackgroundTask
+        mapSnapshotBackgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
+    }
+
+    private func cancelMapRequest() {
+        mapRequest = nil
+        snapshotter?.cancel()
+        snapshotter = nil
+        tileTask?.cancel()
+        tileTask = nil
+        rendering = false
+        endMapSnapshotBackground()
     }
     private func beginHUDBackground() -> Bool {
         endHUDBackground()
@@ -323,7 +376,9 @@ import UserNotifications
                 else {
                     UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.forgotID])
                     self.clearParking() // back in range of the HUD: you are at the bike
-                    self.bluetooth.sendSpeed(self.latestSpeed); self.weatherSentAt = .distantPast; self.tripSentAt = .distantPast; self.todaySentAt = .distantPast; self.todaySent = -1 }
+                    self.bluetooth.sendSpeed(self.simulating ? self.simulationFix.map { $0.speed * 3.6 } : self.latestSpeed)
+                    self.weatherSentAt = .distantPast; self.tripSentAt = .distantPast; self.todaySentAt = .distantPast; self.todaySent = -1
+                }
                 self.updateHUDLocationActivity()
             }
         }
@@ -340,8 +395,16 @@ import UserNotifications
         locations.distanceFilter = kCLDistanceFilterNone
         locations.activityType = .automotiveNavigation
         locations.pausesLocationUpdatesAutomatically = false
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.renderIfNeeded(); self?.sendRideInfo() }
+        // A background relaunch (Bluetooth restore or significant location change) must
+        // bring the location session back without waiting for the app to be opened.
+        DispatchQueue.main.async { [weak self] in self?.updateHUDLocationActivity() }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.advanceSimulation()
+                self.sendRideInfo()
+                self.renderIfNeeded()
+            }
         }
     }
     func requestLocation() {
@@ -355,6 +418,9 @@ import UserNotifications
             return
         }
         locations.requestWhenInUseAuthorization()
+        // Route planning needs a precise fix even while the HUD is away (coarse keep-alive mode).
+        locations.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+        locations.distanceFilter = kCLDistanceFilterNone
         locations.startUpdatingLocation()
     }
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -364,6 +430,13 @@ import UserNotifications
             locationDenied = false
             manager.startUpdatingLocation()
             updateHUDLocationActivity()
+            // Ask once to upgrade to "Always" so GPS and voice keep working after iOS closes
+            // the app; iOS shows its own prompt at a moment it chooses.
+            if manager.authorizationStatus == .authorizedWhenInUse
+                && !UserDefaults.standard.bool(forKey:"hudAskedAlways") {
+                UserDefaults.standard.set(true,forKey:"hudAskedAlways")
+                manager.requestAlwaysAuthorization()
+            }
             if !navigating && !preparing { status = "Đang lấy vị trí…" }
         case .denied, .restricted:
             locationDenied = true; waitingToStart = false; preparing = false
@@ -377,9 +450,13 @@ import UserNotifications
     }
     func locationManager(_ manager: CLLocationManager, didUpdateLocations fixes: [CLLocation]) {
         guard let fix = fixes.last, fix.horizontalAccuracy >= 0 else { return }
+        if navigating && UIApplication.shared.applicationState != .active && Date().timeIntervalSince(lastBackgroundFixLog) > 30 {
+            lastBackgroundFixLog = Date()
+            HUDDiagnostics.record("HUD GPS background fix: acc=\(Int(fix.horizontalAccuracy)); age=\(Int(-fix.timestamp.timeIntervalSinceNow))")
+        }
         latestSpeed = HUDWire.speedKmh(metresPerSecond: fix.speed, accuracy: fix.horizontalAccuracy,
             speedAccuracy: fix.speedAccuracy, age: fix.timestamp.timeIntervalSinceNow)
-        bluetooth.sendSpeed(latestSpeed)
+        if !simulating { bluetooth.sendSpeed(latestSpeed) }
         gpsStatus = "GPS ±\(Int(fix.horizontalAccuracy.rounded())) m"
         if locations.accuracyAuthorization == .reducedAccuracy {
             gpsStatus = "Bật Vị trí chính xác trong Cài đặt"
@@ -390,13 +467,14 @@ import UserNotifications
         }
         latest = fix
         currentCoordinate = fix.coordinate
+        warmMapSnapshotIfNeeded(from: fix)
         refreshWeatherIfNeeded(fix)
         addTodayDistance(fix)
         if waitingToStart {
             hudGPSWaitTimer?.invalidate(); hudGPSWaitTimer=nil
             waitingToStart = false; plan(from: fix); return
         }
-        if !navigating { return }
+        if !navigating || simulating { return }
         if externalGuidance { renderIfNeeded(); return }
         if geometry == nil && !planning && Date().timeIntervalSince(lastPlan) > 30 { plan(from: fix) }
         updateProgress(fix)
@@ -458,17 +536,20 @@ import UserNotifications
             sendHUDSearch(session,phase:3,index:0,total:0,text:"Mở HUD Connect rồi thử tìm lại."); return
         }
         sendHUDSearch(session, phase: 0, index: 0, total: 0, text: "Đang tìm \"\(trimmed)\"…")
-        let request = MKLocalSearch.Request(); request.naturalLanguageQuery = query
-        if let latest { request.region = MKCoordinateRegion(center: latest.coordinate, latitudinalMeters: 20000, longitudinalMeters: 20000) }
-        let operation = MKLocalSearch(request: request); search=operation; searching=true
-        operation.start { [weak self, weak operation] response, error in
-            Task { @MainActor in
-                guard let self, self.search === operation, self.hudSearchSession == session else { return }
+        searching=true
+        hudSearchTask?.cancel()
+        hudSearchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Same engine as the app's search box: Apple Maps suggestions first, then
+            // a plain-language search nearby and nationwide.
+            let (items, source) = await self.placeSearch(trimmed)
+            guard !Task.isCancelled, self.hudSearchSession == session else { return }
+            do {
                 defer { self.finishHUDBackgroundIfIdle() }
-                self.searching=false; self.hudSearchResults=Array((response?.mapItems ?? []).prefix(5)); self.results=self.hudSearchResults
-                HUDDiagnostics.record("HUD destination search: results=\(self.hudSearchResults.count); errorDomain=\((error as NSError?)?.domain ?? "none"); errorCode=\((error as NSError?)?.code ?? 0); appState=\(UIApplication.shared.applicationState.rawValue)")
-                guard error == nil, !self.hudSearchResults.isEmpty else {
-                    self.sendHUDSearch(session, phase: 3, index: 0, total: 0, text: error == nil ? "Không tìm thấy \"\(trimmed)\". Hãy nói tên khác." : (error?.localizedDescription ?? "")); return
+                self.searching=false; self.hudSearchResults=Array(items.prefix(5)); self.results=self.hudSearchResults
+                HUDDiagnostics.record("HUD destination search: query=\(trimmed); results=\(self.hudSearchResults.count); source=\(source); appState=\(UIApplication.shared.applicationState.rawValue)")
+                guard !self.hudSearchResults.isEmpty else {
+                    self.sendHUDSearch(session, phase: 3, index: 0, total: 0, text: "Không tìm thấy \"\(trimmed)\". Hãy nói tên khác."); return
                 }
                 for (index,item) in self.hudSearchResults.enumerated() {
                     let name=item.name ?? "Điểm đến"
@@ -482,7 +563,41 @@ import UserNotifications
             }
         }
     }
+    private var hudSearchTask: Task<Void, Never>?
+    private var lastBackgroundFixLog = Date.distantPast
+    private var loggedFirstFrame = false
+    private var lastViewHeading = 0.0
+
+    /// Places for a spoken/typed name, the way the app's search box finds them:
+    /// 1. MKLocalSearchCompleter suggestions (what Apple Maps autocompletes), each resolved
+    ///    to a map item; 2. plain-language search within 20 km; 3. the same nationwide.
+    func placeSearch(_ query: String) async -> (items: [MKMapItem], source: String) {
+        let near = latest?.coordinate
+        let suggestions = await OneShotCompleter().results(for: query, near: near)
+        var items: [MKMapItem] = []
+        for completion in suggestions.prefix(6) where !completion.title.isEmpty {
+            if Task.isCancelled { break }
+            if let item = try? await MKLocalSearch(request: MKLocalSearch.Request(completion: completion)).start().mapItems.first {
+                let duplicate = items.contains { existing in
+                    existing.name == item.name &&
+                    (existing.placemark.location?.distance(from: item.placemark.location ?? CLLocation()) ?? 1e9) < 50
+                }
+                if !duplicate { items.append(item) }
+            }
+        }
+        if !items.isEmpty { return (items, "suggestions") }
+        for metres in [20_000.0, 1_500_000.0] {
+            let request = MKLocalSearch.Request(); request.naturalLanguageQuery = query
+            if let near { request.region = MKCoordinateRegion(center: near, latitudinalMeters: metres, longitudinalMeters: metres) }
+            if let found = try? await MKLocalSearch(request: request).start().mapItems, !found.isEmpty {
+                return (found, metres < 100_000 ? "nearby" : "nationwide")
+            }
+        }
+        return ([], "none")
+    }
+
     func handleHUDSearchControl(session: UInt32, action: UInt8, index: UInt8) {
+        HUDDiagnostics.record("HUD search control: action=\(action); sessionMatch=\(hudSearchSession == session); previewReady=\(hudPreviewReady); route=\(route != nil); preparing=\(preparing); appState=\(UIApplication.shared.applicationState.rawValue)")
         guard hudSearchSession == session else { return }
         switch action {
         case 0:
@@ -551,6 +666,7 @@ import UserNotifications
         endHUDBackground()
         hudSelectionFromAI=false
         hudChoiceContext=UUID().uuidString; hudChoiceAt=Date(); hudPreviewReady=false
+        if simulating { clearSimulation(); bluetooth.sendInfo(Data([2])); tripSentKey = "" }
         if navigating { navigating=false; bluetooth.stopNavigation() }
         resetCamera()
         externalGuidance = false
@@ -578,15 +694,42 @@ import UserNotifications
                 }
             }
         }
+        // A route's start point need not be live: plan at once from the last good fix (up to
+        // 30 min old, ~100 m) and let live GPS take over once guidance runs. This matters when
+        // the HUD starts a route while the iPhone is locked and GPS cannot start right away.
+        let candidates: [CLLocation] = [latest, locations.location].compactMap { $0 }
+        let usable: [CLLocation] = candidates.filter { fix in
+            let age: Double = abs(fix.timestamp.timeIntervalSinceNow)
+            return fix.horizontalAccuracy >= 0 && fix.horizontalAccuracy <= 100 && age < 1800
+        }
+        let known: CLLocation? = usable.max { $0.timestamp < $1.timestamp }
+        if let known, abs(known.timestamp.timeIntervalSinceNow) >= 30 {
+            HUDDiagnostics.record("HUD destination prepare: using last fix, age=\(Int(abs(known.timestamp.timeIntervalSinceNow)))s")
+            waitingToStart = false
+            requestLocation()          // refresh in the background if iOS allows it
+            plan(from: known); return
+        }
+        let backgroundNoGPS = UIApplication.shared.applicationState != .active
+            && locations.authorizationStatus != .authorizedAlways
+        let latestFresh: Bool = latest.map { abs($0.timestamp.timeIntervalSinceNow) < 30 } ?? false
+        if !latestFresh, backgroundNoGPS, let session=hudSearchSession {
+            // iOS will not start GPS from the background with "When In Use": say so now instead of waiting.
+            preparing=false; hudPreviewReady=false
+            status=Self.alwaysHint
+            endHUDPreparationLocation()
+            sendHUDSearch(session,phase:3,index:0,total:0,text:status)
+            finishHUDBackgroundIfIdle()
+            return
+        }
         guard let latest, abs(latest.timestamp.timeIntervalSinceNow) < 30 else {
             waitingToStart = true
             status = "Đang lấy vị trí mới; có GPS sẽ tự tính tuyến"
             if let session=hudSearchSession {
-                hudGPSWaitTimer=Timer.scheduledTimer(withTimeInterval:20,repeats:false) { [weak self] _ in
+                hudGPSWaitTimer=Timer.scheduledTimer(withTimeInterval:12,repeats:false) { [weak self] _ in
                     Task { @MainActor in
                         guard let self,self.waitingToStart,self.hudSearchSession==session else { return }
                         self.waitingToStart=false; self.preparing=false; self.hudPreviewReady=false
-                        self.status="Chưa lấy được GPS mới. Mở HUD Connect, bật GPS nền rồi thử lại."
+                        self.status="Chưa lấy được GPS. Mở HUD Connect trên iPhone rồi thử lại."
                         self.endHUDPreparationLocation()
                         self.sendHUDSearch(session,phase:3,index:0,total:0,text:self.status)
                         self.finishHUDBackgroundIfIdle()
@@ -598,12 +741,19 @@ import UserNotifications
         waitingToStart = false
         plan(from: latest)
     }
+    static let alwaysHint = "Chưa lấy được vị trí khi iPhone khóa. Mở HUD Connect, hoặc vào Cài đặt › HUD Connect › Vị trí › Luôn luôn."
+
     func beginGuidance() {
-        guard route != nil, !preparing, bluetooth.ready else { return }
-        guidanceRequested = true; navigating = true
+        guard route != nil, !preparing, !navigating, bluetooth.ready else { return }
+        if UIApplication.shared.applicationState != .active && locations.authorizationStatus != .authorizedAlways {
+            // Guidance still starts, but live GPS needs the app opened once or "Always".
+            HUDDiagnostics.record("HUD guidance: started in background without Always permission")
+            if let session=hudSearchSession { sendHUDSearch(session,phase:6,index:0,total:0,text:"GPS sẽ chạy khi mở HUD Connect. Bật vị trí “Luôn luôn” để không cần mở.") }
+        }
+        guidanceRequested = true; navigating = true; loggedFirstFrame = false
         hudPreparationTimer?.invalidate(); hudPreparationTimer=nil
-        locations.allowsBackgroundLocationUpdates = true
-        locations.showsBackgroundLocationIndicator = true
+        updateHUDLocationActivity()   // navigating: background GPS on and running, even if started from the HUD
+        HUDDiagnostics.record("HUD guidance: started; appState=\(UIApplication.shared.applicationState.rawValue); allowsBackground=\(locations.allowsBackgroundLocationUpdates); auth=\(locations.authorizationStatus.rawValue)")
         status = "Đang dẫn đường · tuyến \(transport.lowercased())"
         if let coordinate = destination?.placemark.coordinate {
             let place = SavedPlace(name: destinationName, address: destinationAddress, latitude: coordinate.latitude, longitude: coordinate.longitude)
@@ -614,6 +764,67 @@ import UserNotifications
         publishHUDHistory()
         if let latest { updateProgress(latest) }
         lastRender = .distantPast; renderIfNeeded()
+    }
+
+    func beginSimulation() {
+        guard canSimulate, route != nil, !preparing, !planning, !navigating, bluetooth.ready else { return }
+        hudPreparationTimer?.invalidate(); hudPreparationTimer = nil
+        hudSearchSession = nil; hudPreviewReady = false; hudChoiceContext = UUID().uuidString
+        resetCamera()
+        progress = 0; segment = 0
+        simulationTickAt = ProcessInfo.processInfo.systemUptime - 0.25
+        simulationSpeedSentAt = 0
+        simulating = true; navigating = true; loggedFirstFrame = false
+        status = "Đang chạy thử"
+        updateHUDLocationActivity()
+        advanceSimulation(starting: true)
+        publishHUDHistory()
+        tripSentKey = ""
+        sendRideInfo()
+        lastRender = .distantPast
+        renderIfNeeded()
+        HUDDiagnostics.record("HUD route simulation: started")
+    }
+
+    private func advanceSimulation(starting: Bool = false) {
+        guard simulating, let geometry, let total = geometry.cumulative.last else { return }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let elapsed = uptime - simulationTickAt
+        guard starting || elapsed >= 0.08 else { return }
+        simulationTickAt = uptime
+        if simulationFinished { sendSimulationSpeed(0, at: uptime); return }
+        // Bound the step after suspension so a paused iPhone cannot skip through the route.
+        let travelled = starting ? 0 : min(elapsed, 1) * Self.simulationSpeed * Double(simulationRate)
+        let next = min(total, progress + travelled)
+        guard let sample = geometry.sample(at: next) else { return }
+        let coordinate = CLLocationCoordinate2D(latitude: sample.point.latitude, longitude: sample.point.longitude)
+        let finished = next >= total
+        let speed = finished ? 0 : Self.simulationSpeed
+        simulationFix = CLLocation(coordinate: coordinate, altitude: 0, horizontalAccuracy: 1, verticalAccuracy: -1,
+            course: sample.course, courseAccuracy: 1, speed: speed, speedAccuracy: 0, timestamp: Date())
+        simulationCoordinate = coordinate
+        progress = next; segment = sample.segment
+        updateGuidanceInstruction()
+        sendSimulationSpeed(speed, at: uptime, immediate: finished)
+        if finished {
+            simulationFinished = true
+            status = "Đã chạy thử xong"
+            instruction = "Đã đến nơi"
+        }
+    }
+
+    private func sendSimulationSpeed(_ metresPerSecond: Double, at uptime: TimeInterval, immediate: Bool = false) {
+        if (immediate || uptime - simulationSpeedSentAt >= 0.5), bluetooth.sendSpeed(metresPerSecond * 3.6) {
+            simulationSpeedSentAt = uptime
+        }
+    }
+
+    private func clearSimulation() {
+        guard simulating else { return }
+        simulating = false; simulationFinished = false
+        simulationFix = nil; simulationCoordinate = nil
+        bluetooth.sendSpeed(latestSpeed)
+        HUDDiagnostics.record("HUD route simulation: stopped")
     }
     private var transportFallback = false
     func changeTransport() {
@@ -664,12 +875,31 @@ import UserNotifications
                 let coordinates = (0..<route.polyline.pointCount).map { route.polyline.points()[$0].coordinate }
                 let geometry = RouteProgress(points: coordinates.map { GeoPoint($0.latitude, $0.longitude) })
                 self.route = route; self.geometry = geometry; self.plannedRoute = route
+                self.rebuildCachedRoutePath()
                 self.steps = []
                 var lastSegment = 0
-                for step in route.steps where step.distance > 1 && !step.instructions.isEmpty && step.polyline.pointCount > 0 {
-                    let coordinate = step.polyline.points()[step.polyline.pointCount - 1].coordinate
+                // An MKRoute step's instruction happens at the END of its polyline ("in 200 m,
+                // turn left"). The turn angle there comes from the geometry: heading into the
+                // end of this step versus heading out along the next one.
+                let usable = route.steps.filter { $0.distance > 1 && !$0.instructions.isEmpty && $0.polyline.pointCount > 0 }
+                var logged = 0
+                for (index, step) in usable.enumerated() {
+                    let points = (0..<step.polyline.pointCount).map { step.polyline.points()[$0].coordinate }
+                    let coordinate = points[points.count - 1]
+                    var turn: Double?
+                    if index + 1 < usable.count {
+                        let next = usable[index + 1].polyline
+                        let after = (0..<next.pointCount).map { next.points()[$0].coordinate }
+                        turn = Maneuver.turnAngle(into: points, outOf: after)
+                    }
+                    let code = Maneuver.classify(step.instructions, turn: turn, last: index + 1 == usable.count)
+                    if logged < 12 {   // real Apple Maps wording, to refine the keywords later
+                        HUDDiagnostics.record("HUD step: maneuver=\(code); turn=\(turn.map { Int($0) } ?? 999); text=\(step.instructions)")
+                        logged += 1
+                    }
                     if let projected = geometry.project(GeoPoint(coordinate.latitude, coordinate.longitude), startingAt: lastSegment) {
-                        self.steps.append((projected.metres, step.instructions)); lastSegment = projected.segment
+                        self.steps.append(HUDRouteStep(end: projected.metres, text: step.instructions, maneuver: UInt8(code)))
+                        lastSegment = projected.segment
                     }
                 }
                 self.progress = 0; self.segment = 0
@@ -694,14 +924,22 @@ import UserNotifications
             return
         }
         segment = match.segment; progress = match.metres
-        let next = steps.first { $0.end > progress + 3 }
-        instruction = next?.text ?? "Đến gần điểm đến"
+        updateGuidanceInstruction()
         if let destination,
            location.distance(from: CLLocation(latitude: destination.placemark.coordinate.latitude,
                                               longitude: destination.placemark.coordinate.longitude)) < 20,
            (geometry.cumulative.last ?? 0) - progress < 40 {
             status = "Đã đến điểm đến"; instruction = "Đã đến nơi"
         }
+    }
+
+    private func updateGuidanceInstruction() {
+        let upcoming = HUDRouteStep.upcoming(in: steps, progress: progress)
+        let text = upcoming.first?.text ?? "Đến gần điểm đến"
+        let maneuver = upcoming.first.map { Int($0.maneuver) } ?? Maneuver.arrive
+        if instruction != text { instruction = text }
+        if currentManeuver != maneuver { currentManeuver = maneuver }
+        if followingTurn != upcoming.following { followingTurn = upcoming.following }
     }
     // MARK: Anti-theft: parking spot and "forgot the HUD" alert
 
@@ -796,35 +1034,28 @@ import UserNotifications
         guard navigating, !externalGuidance, let route, let geometry else { return }
         let total = geometry.cumulative.last ?? route.distance
         let left = max(0, total - progress)
-        let next = steps.first { $0.end > progress + 3 }
+        let upcoming = HUDRouteStep.upcoming(in: steps, progress: progress)
+        let next = upcoming.first
         let toTurn = max(0, (next?.end ?? total) - progress)
-        let eta = Date().addingTimeInterval(route.distance > 0 ? route.expectedTravelTime * left / route.distance : 0)
+        let seconds = simulating ? left / (Self.simulationSpeed * Double(simulationRate))
+            : route.distance > 0 ? route.expectedTravelTime * left / route.distance : 0
+        let eta = Date().addingTimeInterval(seconds)
         let parts = Calendar.current.dateComponents([.hour, .minute], from: eta)
         let etaMinute = UInt16((parts.hour ?? 0) * 60 + (parts.minute ?? 0))
         let text = next?.text ?? "Đến điểm đến"
-        let maneuver = next == nil ? 6 : Self.maneuver(text)
-        let key = "\(Int(toTurn / 10))|\(Int(left / 50))|\(etaMinute)|\(text)"
+        let maneuver = next?.maneuver ?? UInt8(Maneuver.arrive)
+        let following = upcoming.following
+        let key = "\(Int(toTurn / 10))|\(Int(left / 50))|\(etaMinute)|\(maneuver)|\(text)|\(following?.maneuver ?? 255)|\(following?.metresAfter ?? 0)|\(simulating)"
         guard key != tripSentKey || Date().timeIntervalSince(tripSentAt) > 2 else { return }
-        var data = Data([1])
-        func u32(_ v: Double) { let x = UInt32(max(0, min(Double(UInt32.max), v.rounded()))); data.append(contentsOf: [UInt8(x & 255), UInt8(x >> 8 & 255), UInt8(x >> 16 & 255), UInt8(x >> 24)]) }
-        u32(left); u32(toTurn)
-        data.append(contentsOf: [UInt8(etaMinute & 255), UInt8(etaMinute >> 8), UInt8(maneuver)])
-        var clipped = ""
-        for ch in text { if clipped.utf8.count + String(ch).utf8.count > 140 { break }; clipped.append(ch) }
-        let bytes = Array(clipped.utf8)
-        data.append(contentsOf: bytes)
+        func metres(_ value: Double) -> UInt32 { UInt32(max(0, min(Double(UInt32.max), value.rounded()))) }
+        guard let data = HUDWire.trip(remaining: metres(left), toTurn: metres(toTurn), etaMinute: etaMinute,
+            maneuver: maneuver, instruction: text, following: following, simulating: simulating,
+            maxWrite: bluetooth.infoPayloadLimit) else { return }
         if bluetooth.sendInfo(data) { tripSentAt = Date(); tripSentKey = key }
     }
 
-    nonisolated static func maneuver(_ instruction: String) -> Int {
-        let t = instruction.lowercased()
-        if t.contains("quay đầu") || t.contains("u-turn") || t.contains("make a u") { return 5 }
-        if t.contains("điểm đến") || t.contains("đích") || t.contains("arrive") || t.contains("destination") { return 6 }
-        let slight = t.contains("chếch") || t.contains("hơi") || t.contains("giữ") || t.contains("slight") || t.contains("keep")
-        if t.contains("trái") || t.contains("left") { return slight ? 3 : 1 }
-        if t.contains("phải") || t.contains("right") { return slight ? 4 : 2 }
-        return 0
-    }
+    /// Text-only classification (no geometry), kept for callers without a route.
+    nonisolated static func maneuver(_ instruction: String) -> Int { Maneuver.classify(instruction, turn: nil, last: false) }
 
     private func refreshWeatherIfNeeded(_ fix: CLLocation) {
         let moved = weatherLocation.map { fix.distance(from: $0) > 5000 } ?? true
@@ -870,6 +1101,7 @@ import UserNotifications
         }
         let rise = reply.daily.sunrise.first.map(minuteOfDay) ?? 0xFFFF
         let set = reply.daily.sunset.first.map(minuteOfDay) ?? 0xFFFF
+        if rise < 1440 && set < 1440 && rise < set { sunriseMinute = Int(rise); sunsetMinute = Int(set) }
         let temp = Int16(max(-999, min(999, (reply.current.temperature_2m * 10).rounded())))
         let wait = UInt16(rainIn.map { min($0, 0xFFFE) } ?? 0xFFFF)
         var payload = Data([3, UInt8(min(100, chance))])
@@ -888,6 +1120,7 @@ import UserNotifications
     }
 
     func stop() {
+        clearSimulation()
         endHUDBackground()
         endHUDPreparationLocation()
         hudChoiceContext=UUID().uuidString; hudPreviewReady=false; hudSearchSession=nil; hudSearchResults=[]
@@ -897,78 +1130,195 @@ import UserNotifications
         guidanceRequested = false; preparing = false; plannedRoute = nil
         revision += 1; directions?.cancel(); resetMapRenderer()
         planning = false; rendering = false; navigating = false
-        route = nil; geometry = nil; steps = []; preview = nil
-        locations.allowsBackgroundLocationUpdates = hudLocationActivity != nil
+        route = nil; geometry = nil; steps = []; preview = nil; followingTurn = nil
+        // Keep the optional background location session ready for a later HUD search.
         status = "Đã dừng dẫn đường"; instruction = "Chưa bắt đầu dẫn đường"
         bluetooth.stopNavigation()
         bluetooth.sendInfo(Data([2])); tripSentKey = ""
+        updateHUDLocationActivity()
         publishHUDHistory()
     }
+    func mapApplicationStateChanged() {
+        cancelMapRequest()
+        snapshotAttemptAt = .distantPast
+        if navigating { renderIfNeeded() }
+        else if let latest { warmMapSnapshotIfNeeded(from: latest) }
+    }
+
     private func renderIfNeeded() {
         guard navigating, bluetooth.ready, !bluetooth.voiceActive, !bluetooth.speakerActive, !planning,
-              let latest, externalGuidance || route != nil, abs(latest.timestamp.timeIntervalSinceNow) < 10,
-              latest.horizontalAccuracy <= 50 else { return }
+              externalGuidance || route != nil else { return }
         let now = Date()
-        let light = bluetooth.settings.theme >= 4
-        renderedMarker = markerState.update(speed: latest.speed, horizontalAccuracy: latest.horizontalAccuracy,
-            course: latest.course, courseAccuracy: latest.courseAccuracy,
-            age: latest.timestamp.timeIntervalSinceNow, now: now)
+        let fix = simulating ? simulationFix : latest.flatMap { abs($0.timestamp.timeIntervalSince(now)) < 10 ? $0 : nil }
+        let predicted = simulating ? fix : fix.map { predictedLocation($0, now: now) }
+        // Browsing a fixed location does not depend on GPS continuing to report.
+        guard let center = browseCenter ?? predicted?.coordinate else { return }
+        let light = mapUsesLightStyle()
+        if let fix {
+            renderedMarker = markerState.update(speed: fix.speed, horizontalAccuracy: fix.horizontalAccuracy,
+                course: fix.course, courseAccuracy: fix.courseAccuracy,
+                age: fix.timestamp.timeIntervalSince(now), now: now)
+        }
         let heading = browseCenter != nil ? browseHeading :
-            latest.course >= 0 && latest.speed > 1.5 ? latest.course : snapshotHeading
-        if rendering && now.timeIntervalSince(snapshotAttemptAt) > 8 {
-            snapshotter?.cancel(); snapshotter = nil; rendering = false
+            fix.map { $0.course >= 0 && $0.speed > 1.5 ? $0.course : lastViewHeading } ?? lastViewHeading
+        if browseCenter == nil { lastViewHeading = heading }
+
+        let appState = UIApplication.shared.applicationState
+        let inBackground = appState == .background
+        // Restore the Apple image when browsing back into its coverage. Keep the last one
+        // even after a background tile request replaces the current base.
+        let maxAppleZoom = 2.25
+        if inBackground, cachedBase?.isRaster == true, let apple = lastAppleBase {
+            let zoom = apple.distance / cameraDistance
+            if zoom <= maxAppleZoom,
+               Self.roomInBase(apple, center: center, heading: heading, scale: zoom) >= 12 {
+                cancelMapRequest()
+                cachedBase = apple
+                rebuildCachedRoutePath()
+                forceFrame = true
+                HUDDiagnostics.record("HUD map: restored Apple base in background")
+            }
+        }
+
+        // Keep composing from the current base while a replacement loads.
+        let base = cachedBase
+        let scale = base.map { $0.distance / cameraDistance } ?? 1
+        let room = base.map { Self.roomInBase($0, center: center, heading: heading, scale: scale) } ?? -.infinity
+        let moving = browseCenter == nil && (fix?.speed ?? 0) >= 1
+        let needsBase: Bool
+        if inBackground, let base, !base.isRaster {
+            // Start refreshing before the moving rider reaches the edge. Panning and modest
+            // zoom can reuse the existing Apple projection until the requested view leaves it.
+            let verticalMargin = (base.image.size.height - Double(HUDWire.imageHeight) / scale) / 2
+            let refreshMargin = min(80, max(0, verticalMargin * 0.7))
+            needsBase = room < (moving ? refreshMargin : 0) || scale > maxAppleZoom
+        } else {
+            needsBase = base == nil || base?.isRaster != inBackground || base?.light != light ||
+                abs(scale - 1) > 0.001 || room < 40
+        }
+        if rendering && now.timeIntervalSince(snapshotAttemptAt) > 18 {
+            cancelMapRequest()
             snapshotAttemptAt = now
         }
-        let needsBase = cachedSnapshot == nil || snapshotEpoch != cameraEpoch || snapshotLight != light || HUDMapCadence.refreshBase(
-            age: now.timeIntervalSince(snapshotAt),
-            movement: browseCenter != nil ? 0 : snapshotLocation.map { latest.distance(from: $0) } ?? .infinity,
-            headingChange: HUDMapCadence.headingChange(heading, snapshotHeading))
-        if needsBase && !rendering && now.timeIntervalSince(snapshotAttemptAt) >= 1.5 {
-            requestSnapshot(location: latest, heading: heading, light: light)
+        if needsBase, !rendering, appState != .inactive, now.timeIntervalSince(snapshotAttemptAt) >= 2 {
+            requestMapBase(center: center, heading: heading, light: light, inBackground: inBackground)
         }
-        // A pending tile fetch must not hold up the latest position/instruction.
-        guard !bluetooth.busy, !encoding, let snapshot = cachedSnapshot, snapshotLight == light, snapshotEpoch == cameraEpoch,
-              sentCameraEpoch != snapshotEpoch || HUDMapCadence.sendFrame(age: now.timeIntervalSince(lastRender),
-                movement: sentLocation.map { latest.distance(from: $0) } ?? .infinity,
-                changed: sentBaseVersion != baseVersion || sentInstruction != instruction || sentMarker != renderedMarker,
-                speed: max(0, latest.speed)) else { return }
-        // Drawing and JPEG encoding take tens of milliseconds; run them off the
-        // main actor so the UI, GPS callbacks and BLE pump are never blocked.
-        let remaining = max(0, (steps.first { $0.end > progress + 3 }?.end ?? progress) - progress)
-        let job = MapRenderJob(snapshot: snapshot, location: latest, marker: renderedMarker, light: light,
-            heading: snapshotHeading, center: snapshotCenter, epoch: snapshotEpoch, baseVersion: baseVersion,
-            routePath: cachedRoutePath, instruction: instruction, remaining: remaining,
-            externalGuidance: externalGuidance, revision: revision, maxBytes: HUDWire.maxImage)
+
+        let changed = sentBaseVersion != baseVersion || sentInstruction != instruction || sentMarker != renderedMarker
+        let wantFrame = forceFrame || sentCameraEpoch != cameraEpoch || (moving
+            ? now.timeIntervalSince(lastRender) >= 0.1
+            : HUDMapCadence.sendFrame(age: now.timeIntervalSince(lastRender),
+                movement: fix.flatMap { current in sentLocation.map { current.distance(from: $0) } } ?? 0,
+                changed: changed, speed: 0))
+        guard let base, room >= 0, !bluetooth.busy, !encoding, wantFrame else { return }
+        var motion: MapFrameMotion?
+        let availableMargin = min(Double(HUDWire.maxMotionMargin), room * scale)
+        if moving, !externalGuidance, !base.isRaster, let fix, fix.speed >= 2, fix.course >= 0,
+           fix.courseAccuracy >= 0, fix.courseAccuracy <= 25, fix.horizontalAccuracy <= 25,
+           abs(fix.timestamp.timeIntervalSince(now)) < 2, availableMargin >= Double(HUDWire.minMotionMargin) {
+            let speed = fix.speed * (simulating ? Double(simulationRate) : 1)
+            let ahead = Self.ahead(of: center, heading: heading, metres: speed)
+            let a = base.point(for: center), b = base.point(for: ahead)
+            let pixels = hypot(b.x - a.x, b.y - a.y) * scale
+            if pixels.isFinite && pixels >= 1 {
+                // Budget for the in-flight JPEG and the wait for the following one.
+                let wantedMargin = max(24, ceil(pixels * 0.9 / 8) * 8)
+                var previousFrame: UInt32 = 0
+                var advance: Int16 = 0
+                if let previous = frameContexts.last, previous.hasMotion, sentBaseVersion == baseVersion,
+                   sentCameraEpoch == cameraEpoch, abs(previous.scale - scale) < 0.001 {
+                    let turn = (heading - previous.heading + 540).truncatingRemainder(dividingBy: 360) - 180
+                    let point = base.point(for: previous.center)
+                    let angle = (heading - base.heading) * .pi / 180
+                    let dy = ((point.y - a.y) * cos(angle) - (point.x - a.x) * sin(angle)) * scale
+                    if abs(turn) <= 5, abs(dy) <= Double(HUDWire.maxMotionMargin) * 2 {
+                        previousFrame = previous.id
+                        advance = Int16(dy.rounded())
+                    }
+                }
+                motion = MapFrameMotion(speed: UInt16(min(2000, (pixels * 10).rounded())),
+                    marker: renderedMarker, light: base.light, margin: UInt8(min(availableMargin, wantedMargin)),
+                    previousFrame: previousFrame, advance: advance)
+            }
+        }
+        let job = MapRenderJob(base: base, location: predicted, marker: renderedMarker, viewHeading: heading,
+            scale: scale, center: center, motion: motion, epoch: cameraEpoch, baseVersion: baseVersion, routePath: cachedRoutePath,
+            instruction: instruction, externalGuidance: externalGuidance, revision: revision)
         encoding = true
         lastRender = now
         Task.detached(priority: .userInitiated) { [weak self] in
-            let started = Date()
             let result = Self.renderFrame(job)
-            let ms = Int(Date().timeIntervalSince(started) * 1000)
-            await self?.finishRender(job, result: result, renderMs: ms)
+            await self?.finishRender(job, result: result)
         }
     }
-    private func finishRender(_ job: MapRenderJob, result: (image: UIImage, jpeg: Data)?, renderMs: Int) {
+
+    nonisolated private static func roomInBase(_ base: HUDMapBase, center: CLLocationCoordinate2D,
+                                              heading: Double, scale: Double) -> Double {
+        let point = base.point(for: center)
+        let radians = (heading - base.heading) * .pi / 180
+        let cosine = abs(cos(radians)), sine = abs(sin(radians))
+        let width = Double(HUDWire.imageWidth) / (2 * scale)
+        let height = Double(HUDWire.imageHeight) / (2 * scale)
+        let roomX = min(point.x, base.image.size.width - point.x) - (width * cosine + height * sine)
+        let roomY = min(point.y, base.image.size.height - point.y) - (width * sine + height * cosine)
+        return min(roomX, roomY)
+    }
+
+    private func finishRender(_ job: MapRenderJob, result: (image: UIImage, jpeg: Data)?) {
         encoding = false
-        // Drop frames made for a camera, route or session that has since changed.
         guard let result, navigating, job.revision == revision, job.epoch == cameraEpoch,
-              job.epoch == snapshotEpoch, !bluetooth.busy else { return }
-        print("HUD map: renderMs=\(renderMs); jpegBytes=\(result.jpeg.count)")
+              job.baseVersion == baseVersion else { return }
+        // A JPEG can fill the BLE write queue. Give pending turn information a slot first.
+        sendRideInfo()
+        guard let id = bluetooth.send(jpeg: result.jpeg, externalGuidance: job.externalGuidance, motion: job.motion) else { return }
         preview = result.image
-        sentLocation = job.location; sentInstruction = job.instruction; sentBaseVersion = job.baseVersion
-        if let id = bluetooth.send(jpeg: result.jpeg, externalGuidance: job.externalGuidance) {
-            sentCameraEpoch = job.epoch; sentMarker = job.marker
-            frameContexts.append(FrameContext(id: id, snapshot: job.snapshot, center: job.center, heading: job.heading))
-            if frameContexts.count > 6 { frameContexts.removeFirst(frameContexts.count - 6) }
+        forceFrame = false
+        sentLocation = job.location
+        sentInstruction = job.instruction
+        sentBaseVersion = job.baseVersion
+        sentCameraEpoch = job.epoch
+        sentMarker = job.marker
+        if !loggedFirstFrame {
+            loggedFirstFrame = true
+            HUDDiagnostics.record("HUD map: first frame; raster=\(job.base.isRaster); appState=\(UIApplication.shared.applicationState.rawValue)")
         }
+        frameContexts.append(FrameContext(id: id, base: job.base, center: job.center, heading: job.viewHeading,
+            scale: job.scale, hasMotion: job.motion != nil))
+        if frameContexts.count > 24 { frameContexts.removeFirst(frameContexts.count - 24) }
     }
+
     private func resetMapRenderer() {
-        snapshotter?.cancel(); snapshotter = nil; rendering = false
-        cachedSnapshot = nil; cachedRoutePath = nil; snapshotLocation = nil
-        snapshotAt = .distantPast; snapshotAttemptAt = .distantPast
-        baseVersion = 0; sentBaseVersion = -1; sentLocation = nil; sentInstruction = ""
+        cancelMapRequest()
+        cachedRoutePath = nil
+        snapshotAttemptAt = .distantPast
+        baseVersion &+= 1
+        sentBaseVersion = -1
+        sentLocation = nil
+        sentInstruction = ""
         lastRender = .distantPast
-        snapshotEpoch = -1; sentCameraEpoch = -1
+        sentCameraEpoch = -1
+    }
+
+    private func warmMapSnapshotIfNeeded(from location: CLLocation) {
+        guard UIApplication.shared.applicationState == .active, bluetooth.ready,
+              !navigating, !preparing, !rendering, Date().timeIntervalSince(snapshotAttemptAt) >= 3 else { return }
+        let light = mapUsesLightStyle()
+        let stale = Date().timeIntervalSince(snapshotAt) > 180
+        let moved = snapshotLocation.map { location.distance(from: $0) > 150 } ?? true
+        guard cachedBase == nil || cachedBase?.isRaster == true || cachedBase?.light != light || stale || moved else { return }
+        requestMapBase(center: location.coordinate, heading: 0, light: light, inBackground: false)
+    }
+    private func rebuildCachedRoutePath() {
+        guard let base = cachedBase else { return }
+        let path = CGMutablePath()
+        if let route, !externalGuidance {
+            for index in 0..<route.polyline.pointCount {
+                let point = base.point(for: route.polyline.points()[index].coordinate)
+                if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+            }
+        }
+        cachedRoutePath = path
+        baseVersion &+= 1
     }
     private func resetCamera() {
         cameraDistance = 800; browseCenter = nil; browseHeading = 0
@@ -976,21 +1326,37 @@ import UserNotifications
     }
     private func handleMapControl(_ control: HUDMapControl) {
         if control.command == .stop {
-            stop(); HUDDiagnostics.record("HUD map: trip stopped from HUD"); return
+            stop()
+            HUDDiagnostics.record("HUD map: trip stopped from HUD")
+            return
         }
-        guard navigating, let frame = frameContexts.last(where: { $0.id == control.frameID }) else { return }
+        guard navigating else { return }
+        let frame = frameContexts.last { $0.id == control.frameID }
         switch control.command {
         case .zoomIn: cameraDistance = max(180, cameraDistance / 1.5)
         case .zoomOut: cameraDistance = min(5000, cameraDistance * 1.5)
         case .follow: browseCenter = nil
+        case .transform:
+            cameraDistance = min(5000, max(180, cameraDistance / (Double(control.dx) / 100)))
+            if abs(control.dy) >= 4, let frame {
+                if browseCenter == nil { browseCenter = frame.center; browseHeading = frame.heading }
+                browseHeading = (browseHeading - Double(control.dy) + 360).truncatingRemainder(dividingBy: 360)
+            }
         case .browse:
-            browseCenter = frame.center; browseHeading = frame.heading
+            guard let frame else { return }
+            browseCenter = frame.center
+            browseHeading = frame.heading
         case .pan:
+            guard let frame else { return }
             let origin = MKMapPoint(frame.center)
-            let point = frame.snapshot.point(for: frame.center)
-            let x = frame.snapshot.point(for: MKMapPoint(x: origin.x + 1000, y: origin.y).coordinate)
-            let y = frame.snapshot.point(for: MKMapPoint(x: origin.x, y: origin.y + 1000).coordinate)
-            guard let offset = HUDMapControl.mapOffset(dx: Double(control.dx), dy: Double(control.dy),
+            let point = frame.base.point(for: frame.center)
+            let x = frame.base.point(for: MKMapPoint(x: origin.x + 1000, y: origin.y).coordinate)
+            let y = frame.base.point(for: MKMapPoint(x: origin.x, y: origin.y + 1000).coordinate)
+            // Invert the same rotation and zoom used to draw the frame.
+            let radians = (frame.heading - frame.base.heading) * .pi / 180
+            let dx = (Double(control.dx) * cos(radians) - Double(control.dy) * sin(radians)) / frame.scale
+            let dy = (Double(control.dx) * sin(radians) + Double(control.dy) * cos(radians)) / frame.scale
+            guard let offset = HUDMapControl.mapOffset(dx: dx, dy: dy,
                 axisX: (x.x - point.x, x.y - point.y), axisY: (y.x - point.x, y.y - point.y)) else { return }
             let world = MKMapSize.world.width
             let shiftedX = origin.x + offset.x * 1000
@@ -1000,118 +1366,194 @@ import UserNotifications
         case .stop: return
         }
         cameraEpoch &+= 1
-        snapshotter?.cancel(); snapshotter = nil; rendering = false; snapshotAttemptAt = .distantPast
-        print("HUD map: control=\(control.command.rawValue)")
+        forceFrame = true
+        cancelMapRequest()
+        snapshotAttemptAt = .distantPast
+        HUDDiagnostics.record("HUD map: control=\(control.command.rawValue); appState=\(UIApplication.shared.applicationState.rawValue)")
         renderIfNeeded()
     }
-    private func requestSnapshot(location: CLLocation, heading: Double, light: Bool) {
-        rendering = true; snapshotAttemptAt = Date()
-        let token = revision
-        let epoch = cameraEpoch
-        let center = browseCenter ?? location.coordinate
+
+    private func requestMapBase(center: CLLocationCoordinate2D, heading: Double, light: Bool, inBackground: Bool) {
+        let request = UUID()
+        mapRequest = request
+        rendering = true
+        snapshotAttemptAt = Date()
         let distance = cameraDistance
+        if inBackground {
+            mapSnapshotBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "HUD map refresh") { [weak self] in
+                guard let self, self.mapRequest == request else { return }
+                self.cancelMapRequest()
+                self.snapshotAttemptAt = Date()
+            }
+            // MapKit can deliver while backgrounded on the tested device. Give it time to
+            // produce an Apple image, then let the street tiles cover a slow or failed request.
+            tileTask = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(8)) }
+                catch { return }
+                self?.startStreetTileFallback(request: request, center: center, distance: distance, light: light)
+            }
+            HUDDiagnostics.record("HUD map: requested Apple base in background")
+        }
         let options = MKMapSnapshotter.Options()
-        options.size = CGSize(width: HUDWire.imageWidth, height: HUDWire.imageHeight); options.scale = 1
+        // Use the compact capture from the original app for background requests.
+        options.size = inBackground ? CGSize(width: 300, height: 200)
+            : CGSize(width: HUDWire.imageWidth + 448, height: HUDWire.imageHeight + 448)
+        options.scale = 1
         options.traitCollection = UITraitCollection(userInterfaceStyle: light ? .light : .dark)
         options.mapType = .standard
         options.showsBuildings = false
         options.pointOfInterestFilter = .excludingAll
-        options.camera = MKMapCamera(lookingAtCenter: center, fromDistance: distance, pitch: 0, heading: heading)
+        let captureDistance = inBackground ? distance : distance * options.size.height / Double(HUDWire.imageHeight + 240)
+        // Enlarge the compact image before cropping so it still has room for panning.
+        let baseDistance = inBackground ? distance * 1.6 : distance
+        options.camera = MKMapCamera(lookingAtCenter: center, fromDistance: captureDistance, pitch: 0, heading: heading)
         let operation = MKMapSnapshotter(options: options)
         snapshotter = operation
         operation.start { [weak self, weak operation] snapshot, error in
-            Task { @MainActor in
-                guard let self, let operation, self.snapshotter === operation, token == self.revision, epoch == self.cameraEpoch else { return }
-                self.rendering = false; self.snapshotter = nil
-                guard let snapshot else {
-                    if self.cachedSnapshot == nil { self.status = error?.localizedDescription ?? "Chưa tải được nền bản đồ" }
-                    return
+            guard let self, let operation, self.mapRequest == request, self.snapshotter === operation else { return }
+            if let snapshot {
+                self.tileTask?.cancel()
+                if inBackground {
+                    let elapsed = Int(Date().timeIntervalSince(self.snapshotAttemptAt) * 1000)
+                    HUDDiagnostics.record("HUD map: Apple base completed; ms=\(elapsed); appState=\(UIApplication.shared.applicationState.rawValue)")
                 }
-                self.cachedSnapshot = snapshot; self.snapshotLocation = location
-                self.snapshotHeading = heading; self.snapshotLight = light; self.snapshotAt = Date()
-                self.snapshotEpoch = epoch; self.snapshotCenter = center
-                let path = CGMutablePath()
-                if let route = self.route, !self.externalGuidance {
-                    for i in 0..<route.polyline.pointCount {
-                        let point = snapshot.point(for: route.polyline.points()[i].coordinate)
-                        if i == 0 { path.move(to: point) } else { path.addLine(to: point) }
-                    }
-                }
-                self.cachedRoutePath = path; self.baseVersion &+= 1
-                print("HUD map: baseMs=\(Int(Date().timeIntervalSince(self.snapshotAttemptAt) * 1000))")
-                self.renderIfNeeded()
+                let base = HUDMapBase(image: snapshot.image, projection: .apple(snapshot),
+                    distance: baseDistance, heading: heading, light: light)
+                self.completeMapRequest(request, center: center, base: base, error: nil)
+            } else if inBackground {
+                self.startStreetTileFallback(request: request, center: center, distance: distance, light: light)
+            } else {
+                self.completeMapRequest(request, center: center, base: nil, error: error)
             }
         }
     }
+
+    private func startStreetTileFallback(request: UUID, center: CLLocationCoordinate2D, distance: Double, light: Bool) {
+        guard mapRequest == request else { return }
+        let operation = snapshotter
+        snapshotter = nil
+        operation?.cancel()
+        tileTask?.cancel()
+        let size = CGSize(width: HUDWire.imageWidth + 240, height: HUDWire.imageHeight + 240)
+        HUDDiagnostics.record("HUD map: Apple base unavailable, loading street tiles")
+        tileTask = Task { [weak self] in
+            do {
+                let base = try await HUDBackgroundMap.shared.load(center: center, distance: distance, size: size, light: light)
+                self?.completeMapRequest(request, center: center, base: base, error: nil)
+            } catch {
+                self?.completeMapRequest(request, center: center, base: nil, error: error)
+            }
+        }
+    }
+
+    private func completeMapRequest(_ request: UUID, center: CLLocationCoordinate2D,
+                                    base: HUDMapBase?, error: Error?) {
+        guard request == mapRequest else { return }
+        mapRequest = nil
+        snapshotter = nil
+        tileTask = nil
+        rendering = false
+        snapshotAttemptAt = Date()
+        defer { endMapSnapshotBackground() }
+        guard let base else {
+            let error = error as NSError?
+            HUDDiagnostics.record("HUD map: tiles failed; domain=\(error?.domain ?? "none"); code=\(error?.code ?? -1); appState=\(UIApplication.shared.applicationState.rawValue)")
+            return
+        }
+        cachedBase = base
+        if !base.isRaster { lastAppleBase = base }
+        snapshotLocation = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        snapshotAt = Date()
+        rebuildCachedRoutePath()
+        HUDDiagnostics.record("HUD map: street base ready; raster=\(base.isRaster); appState=\(UIApplication.shared.applicationState.rawValue)")
+        renderIfNeeded()
+    }
+    /// Set by HUD map controls: send a frame on the next tick even when nothing moved.
+    private var forceFrame = false
+
+    /// iPhone GPS updates about once a second; between fixes, advance the bike along its
+    /// course at its speed (up to 1.5 s) so every frame shows fresh motion.
+    private func predictedLocation(_ fix: CLLocation, now: Date) -> CLLocation {
+        guard browseCenter == nil, fix.speed >= 1, fix.course >= 0 else { return fix }
+        let dt = min(1.5, max(0, now.timeIntervalSince(fix.timestamp)))
+        let c = Self.ahead(of: fix.coordinate, heading: fix.course, metres: fix.speed * dt)
+        return CLLocation(coordinate: c, altitude: fix.altitude, horizontalAccuracy: fix.horizontalAccuracy,
+                          verticalAccuracy: fix.verticalAccuracy, course: fix.course, speed: fix.speed, timestamp: now)
+    }
+
+    nonisolated private static func ahead(of c: CLLocationCoordinate2D, heading: Double, metres: Double) -> CLLocationCoordinate2D {
+        let r = heading * .pi / 180, earth = 6_371_000.0
+        let dLat = metres * cos(r) / earth
+        let dLon = metres * sin(r) / (earth * cos(c.latitude * .pi / 180))
+        return CLLocationCoordinate2D(latitude: c.latitude + dLat * 180 / .pi, longitude: c.longitude + dLon * 180 / .pi)
+    }
     nonisolated private static func renderFrame(_ job: MapRenderJob) -> (image: UIImage, jpeg: Data)? {
         let image = compose(job)
-        var jpeg = image.jpegData(compressionQuality: 0.55)
-        if let size = jpeg?.count, size > 12 * 1024 { jpeg = image.jpegData(compressionQuality: 0.42) }
-        guard let jpeg, jpeg.count <= job.maxBytes else { return nil }
+        // Smaller frames cross BLE faster: the link, not drawing, limits the frame rate.
+        var jpeg = image.jpegData(compressionQuality: job.motion != nil ? 0.36 : 0.45)
+        if let size = jpeg?.count, size > 14 * 1024 { jpeg = image.jpegData(compressionQuality: 0.35) }
+        if let size = jpeg?.count, size > 20 * 1024 { jpeg = image.jpegData(compressionQuality: 0.28) }
+        guard let jpeg, jpeg.count <= HUDWire.maxImage else { return nil }
         return (image, jpeg)
     }
     nonisolated private static func compose(_ job: MapRenderJob) -> UIImage {
-        let snapshot = job.snapshot, location = job.location, marker = job.marker
-        let instruction = job.instruction, externalGuidance = job.externalGuidance
-        let instructionText = instruction
-        let format = UIGraphicsImageRendererFormat(); format.scale = 1; format.opaque = true
-        let light = job.light
-        let mapInk: UIColor = light ? .systemBlue : .white
-        let textInk: UIColor = light ? .black : .white
-        return UIGraphicsImageRenderer(size: CGSize(width: HUDWire.imageWidth, height: HUDWire.imageHeight), format: format).image { renderer in
-            snapshot.image.draw(at: .zero)
+        let base = job.base
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let ink: UIColor = base.light ? .systemBlue : .white
+        let arrowInk = base.light
+            ? UIColor(red: 185 / 255.0, green: 77 / 255.0, blue: 0, alpha: 1)
+            : UIColor(red: 1, green: 158 / 255.0, blue: 40 / 255.0, alpha: 1)
+        let margin = Int(job.motion?.margin ?? 0)
+        let size = CGSize(width: HUDWire.imageWidth, height: HUDWire.imageHeight + 2 * margin)
+        return UIGraphicsImageRenderer(size: size, format: format).image { renderer in
             let context = renderer.cgContext
-            context.saveGState(); context.clip(to: CGRect(x: 0, y: 0, width: 300, height: 180))
-            context.setStrokeColor(mapInk.cgColor); context.setLineWidth(5); context.setLineCap(.round); context.setLineJoin(.round)
-            if let path = job.routePath { context.addPath(path) }
-            context.strokePath()
-            let point = snapshot.point(for: location.coordinate)
-            context.translateBy(x: point.x, y: point.y)
-            context.setFillColor(mapInk.cgColor); context.setStrokeColor((light ? UIColor.white : UIColor.black).cgColor); context.setLineWidth(2)
-            if marker == .arrow {
-                context.rotate(by: (location.course - job.heading) * .pi / 180)
-                context.move(to: CGPoint(x: 0, y: -11))
-                context.addLine(to: CGPoint(x: -8, y: 9))
-                context.addLine(to: CGPoint(x: 0, y: 5))
-                context.addLine(to: CGPoint(x: 8, y: 9)); context.closePath(); context.drawPath(using: .fillStroke)
-            } else {
-                context.addEllipse(in: CGRect(x: -7, y: -7, width: 14, height: 14)); context.drawPath(using: .fillStroke)
+            let focus = base.point(for: job.center)
+            context.saveGState()
+            context.translateBy(x: size.width / 2, y: size.height / 2)
+            context.rotate(by: -(job.viewHeading - base.heading) * .pi / 180)
+            context.scaleBy(x: job.scale, y: job.scale)
+            context.translateBy(x: -focus.x, y: -focus.y)
+            base.image.draw(at: .zero)
+            if let path = job.routePath {
+                context.addPath(path)
+                context.setStrokeColor(ink.cgColor)
+                context.setLineWidth(5 / job.scale)
+                context.setLineCap(.round)
+                context.setLineJoin(.round)
+                context.strokePath()
+            }
+            if job.motion == nil, let location = job.location {
+                let point = base.point(for: location.coordinate)
+                context.translateBy(x: point.x, y: point.y)
+                context.scaleBy(x: 1 / job.scale, y: 1 / job.scale)
+                context.setFillColor((job.marker == .arrow ? arrowInk : ink).cgColor)
+                context.setStrokeColor((base.light ? UIColor.white : UIColor.black).cgColor)
+                context.setLineWidth(2)
+                if job.marker == .arrow {
+                    context.rotate(by: (location.course - base.heading) * .pi / 180)
+                    context.move(to: CGPoint(x: 0, y: -11))
+                    context.addLine(to: CGPoint(x: -8, y: 9))
+                    context.addLine(to: CGPoint(x: 0, y: 5))
+                    context.addLine(to: CGPoint(x: 8, y: 9))
+                    context.closePath()
+                } else {
+                    context.addEllipse(in: CGRect(x: -7, y: -7, width: 14, height: 14))
+                }
+                context.drawPath(using: .fillStroke)
             }
             context.restoreGState()
-            if externalGuidance { return }
-            let remaining = job.remaining
-            let distance = remaining >= 1000 ? String(format: "%.1f km", remaining / 1000) : "\(Int(remaining.rounded())) m"
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.lineBreakMode = .byWordWrapping
-            paragraph.lineSpacing = 1
-            var font = UIFont.systemFont(ofSize: 14, weight: .semibold)
-            var textRect = CGRect(x: 134, y: 10, width: 153, height: 0)
-            func textHeight() -> CGFloat {
-                ceil((instructionText as NSString).boundingRect(with: CGSize(width: textRect.width, height: .greatestFiniteMagnitude),
-                    options: [.usesLineFragmentOrigin, .usesFontLeading],
-                    attributes: [.font: font, .paragraphStyle: paragraph], context: nil).height)
+            if let credit = base.attribution {
+                let attribution = credit as NSString
+                let style: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: UIColor.white
+                ]
+                let bounds = attribution.size(withAttributes: style)
+                UIColor.black.withAlphaComponent(0.8).setFill()
+                renderer.fill(CGRect(x: 4, y: 82, width: bounds.width + 8, height: bounds.height + 4))
+                attribution.draw(at: CGPoint(x: 8, y: 84), withAttributes: style)
             }
-            // Short turns wrap alongside the distance; longer instructions get
-            // the full width below it rather than losing the destination road.
-            if textHeight() > 52 { textRect = CGRect(x: 12, y: 39, width: 276, height: 0) }
-            while textHeight() > 132 - textRect.minY && font.pointSize > 10 {
-                font = UIFont.systemFont(ofSize: font.pointSize - 1, weight: .semibold)
-            }
-            textRect.size.height = min(textHeight(), 132 - textRect.minY)
-            let bannerHeight = max(44, textRect.maxY + 3)
-            // Keep controls and MapKit attribution below the banner visible.
-            (light ? UIColor.white : UIColor.black).withAlphaComponent(0.9).setFill()
-            UIBezierPath(roundedRect: CGRect(x: 5, y: 5, width: 290, height: bannerHeight), cornerRadius: 7).fill()
-            let words = instruction.lowercased()
-            let symbol = words.contains("quay đầu") || words.contains("u-turn") ? "arrow.uturn.down" :
-                words.contains("trái") || words.contains("left") ? "arrow.turn.up.left" :
-                words.contains("phải") || words.contains("right") ? "arrow.turn.up.right" : "arrow.up"
-            UIImage(systemName: symbol)?.withTintColor(textInk, renderingMode: .alwaysOriginal)
-                .draw(in: CGRect(x: 12, y: 14, width: 22, height: 24))
-            (distance as NSString).draw(in: CGRect(x: 42, y: 9, width: 88, height: 30), withAttributes: [
-                .font: UIFont.boldSystemFont(ofSize: 22), .foregroundColor: textInk])
-            (instructionText as NSString).draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: [.font: font, .foregroundColor: textInk, .paragraphStyle: paragraph], context: nil)
         }
     }
 }
@@ -1124,22 +1566,29 @@ private final class MapLinkRedirectGuard: NSObject, URLSessionTaskDelegate {
 }
 
 /// Everything the off-main renderer needs, captured on the main actor.
-/// MKMapSnapshotter.Snapshot is immutable once delivered, so sharing it is safe.
 private struct MapRenderJob: @unchecked Sendable {
-    let snapshot: MKMapSnapshotter.Snapshot
-    let location: CLLocation
+    let base: HUDMapBase
+    let location: CLLocation?
     let marker: HUDLocationMarker
-    let light: Bool
-    let heading: Double
+    let viewHeading: Double
+    let scale: Double
     let center: CLLocationCoordinate2D
+    let motion: MapFrameMotion?
     let epoch: Int
     let baseVersion: Int
     let routePath: CGPath?
     let instruction: String
-    let remaining: Double
     let externalGuidance: Bool
     let revision: Int
-    let maxBytes: Int
+}
+
+struct MapFrameMotion {
+    let speed: UInt16                 // tenths of a screen pixel per second
+    let marker: HUDLocationMarker
+    let light: Bool
+    let margin: UInt8
+    let previousFrame: UInt32
+    let advance: Int16
 }
 
 struct ParkingSpot: Codable, Equatable {
@@ -1153,4 +1602,100 @@ struct ParkingSpot: Codable, Equatable {
     }
     func save() { if let data = try? JSONEncoder().encode(self) { UserDefaults.standard.set(data, forKey: "hudParking") } }
     static func clear() { UserDefaults.standard.removeObject(forKey: "hudParking") }
+}
+
+/// Turn icons shared with the HUD (byte in the trip message). Mirrors the Apple Maps set.
+enum Maneuver {
+    static let straight = 0, left = 1, right = 2, slightLeft = 3, slightRight = 4, uTurn = 5, arrive = 6
+    static let sharpLeft = 7, sharpRight = 8, keepLeft = 9, keepRight = 10, merge = 11
+    static let rampLeft = 12, rampRight = 13, roundaboutStraight = 14, roundaboutLeft = 15, roundaboutRight = 16, ferry = 17
+
+    static func bearing(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Double {
+        let p1 = a.latitude * .pi / 180, p2 = b.latitude * .pi / 180, dl = (b.longitude - a.longitude) * .pi / 180
+        let y = sin(dl) * cos(p2), x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
+        return (atan2(y, x) * 180 / .pi + 360).truncatingRemainder(dividingBy: 360)
+    }
+    /// Point about `metres` along a polyline from its start (or from its end when `backwards`).
+    static func point(along points: [CLLocationCoordinate2D], metres: Double, backwards: Bool) -> CLLocationCoordinate2D? {
+        let path = backwards ? Array(points.reversed()) : points
+        guard path.count >= 2 else { return nil }
+        var walked = 0.0
+        for i in 1..<path.count {
+            walked += CLLocation(latitude: path[i-1].latitude, longitude: path[i-1].longitude)
+                .distance(from: CLLocation(latitude: path[i].latitude, longitude: path[i].longitude))
+            if walked >= metres { return path[i] }
+        }
+        return path.last
+    }
+    /// Signed turn in degrees at the joint (positive = right), from ~25 m either side.
+    static func turnAngle(into before: [CLLocationCoordinate2D], outOf after: [CLLocationCoordinate2D]) -> Double? {
+        guard let joint = before.last, let back = point(along: before, metres: 25, backwards: true),
+              let ahead = point(along: after, metres: 25, backwards: false) else { return nil }
+        var turn = bearing(joint, ahead) - bearing(back, joint)
+        while turn > 180 { turn -= 360 }
+        while turn <= -180 { turn += 360 }
+        return turn
+    }
+    static func classify(_ instruction: String, turn: Double?, last: Bool) -> Int {
+        let t = instruction.lowercased()
+        func has(_ words: String...) -> Bool { words.contains { t.contains($0) } }
+        let textLeft = has("trái", "left"), textRight = has("phải", "right")
+        let side: Int? = turn.map { $0 < 0 ? -1 : 1 } ?? (textLeft ? -1 : textRight ? 1 : nil)
+        if last || has("điểm đến", "đích", "đã đến", "arrive", "destination") { return arrive }
+        if has("phà", "ferry") { return ferry }
+        if has("vòng xuyến", "bùng binh", "vòng xoay", "roundabout", "rotary") {
+            if let turn, abs(turn) < 35 { return roundaboutStraight }
+            if let s = side { return s < 0 ? roundaboutLeft : roundaboutRight }
+            return roundaboutStraight
+        }
+        if has("quay đầu", "quay lại", "u-turn", "make a u") { return uTurn }
+        if has("nhập vào", "nhập làn", "hợp nhất", "merge") { return merge }
+        if has("lối ra", "lối vào", "đường dẫn", "đường nhánh", "nhánh", "exit", "ramp") {
+            return (side ?? 1) < 0 ? rampLeft : rampRight
+        }
+        if has("giữ bên", "đi về bên", "giữ làn", "keep", "fork") {
+            return textLeft ? keepLeft : textRight ? keepRight : (side ?? 1) < 0 ? keepLeft : keepRight
+        }
+        if let turn {
+            let a = abs(turn), l = turn < 0
+            if a < 20 { return straight }
+            if a < 45 { return l ? slightLeft : slightRight }
+            if a < 135 { return l ? left : right }
+            if a < 165 { return l ? sharpLeft : sharpRight }
+            return uTurn
+        }
+        // No geometry: fall back to the wording.
+        let slight = has("chếch", "hơi", "slight"), sharp = has("gắt", "ngoặt", "sharp")
+        if textLeft { return slight ? slightLeft : sharp ? sharpLeft : left }
+        if textRight { return slight ? slightRight : sharp ? sharpRight : right }
+        return straight
+    }
+}
+
+/// MKLocalSearchCompleter as a single async call (first result batch, 4 s timeout).
+@MainActor final class OneShotCompleter: NSObject, MKLocalSearchCompleterDelegate {
+    private let completer = MKLocalSearchCompleter()
+    private var continuation: CheckedContinuation<[MKLocalSearchCompletion], Never>?
+    func results(for query: String, near: CLLocationCoordinate2D?) async -> [MKLocalSearchCompletion] {
+        completer.delegate = self
+        completer.resultTypes = [.address, .pointOfInterest]
+        if let near { completer.region = MKCoordinateRegion(center: near, latitudinalMeters: 50_000, longitudinalMeters: 50_000) }
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            completer.queryFragment = query
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(4)); self?.finish([])
+            }
+        }
+    }
+    private func finish(_ results: [MKLocalSearchCompletion]) {
+        continuation?.resume(returning: results); continuation = nil
+        completer.cancel()
+    }
+    nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
+        MainActor.assumeIsolated { self.finish(completer.results) }
+    }
+    nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
+        MainActor.assumeIsolated { self.finish([]) }
+    }
 }

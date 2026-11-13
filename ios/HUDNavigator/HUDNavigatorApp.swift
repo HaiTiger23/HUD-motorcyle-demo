@@ -39,8 +39,13 @@ import PhotosUI
                     ai.refreshAuthorization()
                     bluetooth.resume()
                     navigation.updateHUDLocationActivity()
+                    navigation.mapApplicationStateChanged()
                     Task { await receiveDestination() }
-                } else if phase == .background { bluetooth.enterBackground() }
+                } else if phase == .background {
+                    bluetooth.enterBackground()
+                    navigation.updateHUDLocationActivity()   // keep the foreground-created location session alive
+                    navigation.mapApplicationStateChanged()
+                }
             }
         }
     }
@@ -69,10 +74,13 @@ import PhotosUI
         Color(red: 0.6, green: 0.31, blue: 0), Color(red: 0.64, green: 0.15, blue: 0.4)]
     private let themeNames = ["Đại dương", "Rừng xanh", "Hoàng hôn", "Anh đào", "Trắng xanh", "Bạc hà", "Kem", "Hồng sáng"]
     /// HUD face ids (firmware numbering) in gallery order.
-    private let faces: [(id: Int, name: String)] = [(0, "Số lớn"), (2, "Kim hiện đại"), (5, "Kim cổ điển"), (6, "Đi xe"), (8, "iPhone")]
+    private let faces: [(id: Int, name: String)] = [(0, "Số lớn"), (2, "Kim hiện đại"), (5, "Kim cổ điển"), (6, "Đi xe"), (8, "iPhone"), (9, "Infograph")]
     private var photoBackground: Bool { bluetooth.wallpaperBackground ?? false }
     /// Over a photo (and on the iPhone face) the HUD uses the dark twin of a light theme.
-    private func previewTheme(_ face: Int) -> Int { photoBackground || face == 8 ? draft.theme % 4 : draft.theme }
+    private func previewTheme(_ face: Int) -> Int { photoBackground ? draft.theme % 4 : draft.theme }
+    /// Light theme on a colour background: dark ink on the full-screen faces.
+    private var lightFull: Bool { !photoBackground && draft.theme >= 4 }
+    private var fullInk: Color { lightFull ? Color(rgb: 0x142033) : .white }
     private let clockSwatches: [Int] = [0xFFFFFF, 0xFFD60A, 0x64D2FF, 0xFF6482, 0x30D158, 0xBF5AF2]
     @State private var photoItem: PhotosPickerItem?
     @State private var wallpaperImage: UIImage? = WallpaperStore.load()
@@ -157,9 +165,18 @@ import PhotosUI
                         .onChange(of: navigation.backgroundGPS) { _, _ in navigation.saveBackgroundGPS() }
                     if navigation.locationDenied {
                         Button("Cho phép vị trí trong Cài đặt") { openURL(URL(string: UIApplication.openSettingsURLString)!) }
+                    } else {
+                        LabeledContent("Quyền vị trí", value: navigation.locationAlways ? "Luôn luôn" : "Khi dùng app")
+                        if !navigation.locationAlways {
+                            Button("Đổi sang “Luôn luôn”") { openURL(URL(string: UIApplication.openSettingsURLString)!) }
+                        }
                     }
                 } header: { Text("Vị trí") }
-                footer: { Text("Cập nhật tốc độ và tuyến khi iPhone khóa; dùng thêm pin.") }
+                footer: {
+                    Text("Khi bật và HUD đang kết nối, app giữ GPS sẵn sàng để tìm/tính tuyến lúc iPhone khóa; iOS sẽ hiện chỉ báo vị trí và dùng thêm pin. Quyền “Luôn luôn” vẫn cần nếu iOS chưa có phiên nền hoặc app bị tắt hẳn.")
+                    Link("Dữ liệu nền dự phòng HUD © OpenStreetMap", destination: URL(string: "https://www.openstreetmap.org/copyright")!)
+                    Link("Nền dự phòng OpenStreetMap France (CC BY-SA 2.0)", destination: URL(string: "https://www.openstreetmap.fr/open-data/")!)
+                }
             }
             .navigationTitle("Cài đặt")
             .refreshable { bluetooth.refreshSettings() }
@@ -258,13 +275,56 @@ import PhotosUI
         if photoBackground, let wallpaperImage {
             Image(uiImage: wallpaperImage).resizable().scaledToFill().overlay(Color.black.opacity(dim))
         } else if face == 8 {
-            LinearGradient(colors: [themeBackground(previewTheme(face)), Color(rgb: 0x05070C)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [themeBackground(previewTheme(face)), lightFull ? .white : Color(rgb: 0x05070C)], startPoint: .top, endPoint: .bottom)
         } else {
             themeBackground(previewTheme(face))
         }
     }
     private func themeBackground(_ theme: Int) -> Color {
         [0x080E18, 0x071510, 0x181008, 0x150C19, 0xEDF3FA, 0xECF6F0, 0xFFF5E8, 0xFFF0F5].map { Color(rgb: $0) }[theme]
+    }
+
+    /// Infograph: big time, date, one wide weather complication and four ring gauges.
+    private var infographPreview: some View {
+        let rings: [(String, String, Double, Color)] = [("PIN", "86", 0.86, Color(rgb: 0x30D158)), ("KM", "12,4", 0.41, Color(rgb: 0xFF9F0A)),
+                                                         ("ÂM", "18/9", 0.6, Color(rgb: 0x64D2FF)), ("TIN", "3", 0.3, Color(rgb: 0xFF453A))]
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                Text("10:09").font(.system(size: 46, weight: .semibold, design: .rounded)).foregroundStyle(fullInk)
+                Spacer()
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text("CHỦ NHẬT").font(.system(size: 12, weight: .semibold)).foregroundStyle(Color(rgb: 0xFF9F0A))
+                    Text("8/11").font(.system(size: 17, weight: .semibold)).foregroundStyle(fullInk)
+                }.padding(.top, 14)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("THỜI TIẾT").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color(rgb: 0x64D2FF))
+                Text("28° · Không mưa").font(.system(size: 21, weight: .semibold)).foregroundStyle(fullInk)
+                Text("Mọc 05:58  ·  Lặn 17:21").font(.system(size: 11)).foregroundStyle(Color(rgb: 0x98989D))
+            }
+            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(photoBackground ? Color.white.opacity(0.3) : lightFull ? .white : Color(rgb: 0x1C1C1E), in: RoundedRectangle(cornerRadius: 16))
+            HStack(spacing: 8) {
+                ForEach(rings, id: \.0) { ring in
+                    ZStack {
+                        Circle().stroke(ring.3.opacity(0.25), lineWidth: 6)
+                        Circle().trim(from: 0, to: ring.2).stroke(ring.3, style: StrokeStyle(lineWidth: 6, lineCap: .round)).rotationEffect(.degrees(-90))
+                        VStack(spacing: 0) {
+                            Text(ring.1).font(.system(size: 15, weight: .semibold)).foregroundStyle(fullInk)
+                            Text(ring.0).font(.system(size: 10, weight: .semibold)).foregroundStyle(ring.3)
+                        }
+                    }.frame(width: 64, height: 64).frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .frame(width: 320, height: 240)
+        .background {
+            if photoBackground, let wallpaperImage {
+                Image(uiImage: wallpaperImage).resizable().scaledToFill().overlay(Color.black.opacity(0.43))
+            } else { lightFull ? themeBackground(draft.theme) : Color.black }
+        }
+        .clipped()
     }
 
     /// The "Đi xe" face without a trip: speed, clock, today's distance, hint card.
@@ -320,25 +380,26 @@ import PhotosUI
     private var phonePreview: some View {
         ZStack {
             VStack(spacing: 0) {
-                LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom).frame(height: 110)
+                LinearGradient(colors: [.black.opacity(lightFull ? 0 : 0.6), .clear], startPoint: .top, endPoint: .bottom).frame(height: 110)
                 Spacer()
-                LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom).frame(height: 110)
+                LinearGradient(colors: [.clear, .black.opacity(lightFull ? 0 : 0.75)], startPoint: .top, endPoint: .bottom).frame(height: 110)
             }
             VStack(spacing: 0) {
-                Text("Chủ Nhật, 8 tháng 11").font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.9))
+                Text("Chủ Nhật, 8 tháng 11").font(.system(size: 15, weight: .semibold)).foregroundStyle(fullInk.opacity(0.9))
                     .padding(.top, 18)
-                Text("10:08").font(.system(size: 78, weight: .bold, design: .rounded)).foregroundStyle(clockColor)
+                Text("10:08").font(.system(size: 78, weight: .bold, design: .rounded))
+                    .foregroundStyle(lightFull && clockColor.rgb == 0xFFFFFF ? fullInk : clockColor)
                     .padding(.top, 8)
                 Spacer()
                 HStack(spacing: 6) {
                     ForEach([("Thời tiết", "28°"), ("Âm lịch", "18/9"), ("Hôm nay", "12,4 km")], id: \.0) { item in
                         VStack(spacing: 2) {
-                            Text(item.0).font(.system(size: 10)).foregroundStyle(.white.opacity(0.7))
-                            Text(item.1).font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                            Text(item.0).font(.system(size: 10)).foregroundStyle(fullInk.opacity(0.7))
+                            Text(item.1).font(.system(size: 14, weight: .semibold)).foregroundStyle(fullInk)
                         }
                         .frame(maxWidth: .infinity).padding(.vertical, 6)
-                        .background(.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.28), lineWidth: 0.5))
+                        .background(lightFull ? Color(rgb: 0xDFEAF5) : .white.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(lightFull ? 0 : 0.28), lineWidth: 0.5))
                     }
                 }.padding(.horizontal, 8).padding(.bottom, 8)
             }
@@ -352,6 +413,7 @@ import PhotosUI
         switch face {
         case 8: phonePreview
         case 6: ridePreview
+        case 9: infographPreview
         default: classicPreview(face)
         }
     }
@@ -517,11 +579,26 @@ final class PlaceCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDe
         return route.polyline.points()[route.polyline.pointCount - 1].coordinate
     }
     private var searchExpanded: Bool { searchFocused || !query.isEmpty }
+    /// SF Symbol for each maneuver code (same codes the HUD draws). Left variants that have no
+    /// symbol of their own reuse the right one mirrored (`turnMirrored`).
+    static func turnSymbol(_ code: Int) -> String {
+        let symbols = ["arrow.up", "arrow.turn.up.left", "arrow.turn.up.right", "arrow.up.left", "arrow.up.right",
+                       "arrow.uturn.left", "flag.checkered", "arrow.down.left", "arrow.down.right",
+                       "arrow.triangle.branch", "arrow.triangle.branch", "arrow.triangle.merge",
+                       "arrow.up.left", "arrow.up.right", "arrow.triangle.turn.up.right.circle",
+                       "arrow.triangle.turn.up.right.circle", "arrow.triangle.turn.up.right.circle", "ferry"]
+        return symbols[min(symbols.count - 1, max(0, code))]
+    }
+    static func turnMirrored(_ code: Int) -> Bool { code == 9 || code == 15 }
 
     var body: some View {
         MapReader { proxy in
             Map(position: $position, selection: $selectedFeature) {
-                UserAnnotation()
+                if let coordinate = navigation.simulationCoordinate {
+                    Marker("Vị trí chạy thử", systemImage: "location.fill", coordinate: coordinate).tint(.orange)
+                } else {
+                    UserAnnotation()
+                }
                 if let route = navigation.plannedRoute {
                     MapPolyline(route.polyline).stroke(.blue, style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
                 }
@@ -551,6 +628,7 @@ final class PlaceCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDe
             withAnimation { position = .rect(rect.insetBy(dx: -rect.width * 0.25, dy: -rect.height * 0.45)) }
         }
         .onChange(of: navigation.navigating) { _, active in
+            if active && navigation.simulating { return }
             withAnimation { position = .userLocation(followsHeading: active, fallback: .automatic) }
         }
         .onChange(of: query) { _, value in
@@ -578,10 +656,21 @@ final class PlaceCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDe
     private var topBar: some View {
         VStack(spacing: 8) {
             if navigation.navigating {
-                HStack(spacing: 12) {
-                    Image(systemName: "arrow.turn.up.right").font(.title.bold())
-                    Text(navigation.instruction).font(.title3.bold()).lineLimit(2).minimumScaleFactor(0.8)
-                    Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 12) {
+                        Image(systemName: Self.turnSymbol(navigation.currentManeuver)).font(.title.bold())
+                            .scaleEffect(x: Self.turnMirrored(navigation.currentManeuver) ? -1 : 1, y: 1)
+                        Text(navigation.instruction).font(.title3.bold()).lineLimit(2).minimumScaleFactor(0.8)
+                        Spacer(minLength: 0)
+                    }
+                    if let turn = navigation.followingTurn {
+                        HStack(spacing: 8) {
+                            Text("Rồi")
+                            Image(systemName: Self.turnSymbol(Int(turn.maneuver)))
+                                .scaleEffect(x: Self.turnMirrored(Int(turn.maneuver)) ? -1 : 1, y: 1)
+                            Text("\(turn.metresAfter) m")
+                        }.font(.subheadline.weight(.semibold))
+                    }
                 }
                 .foregroundStyle(.white).padding(14)
                 .background(Color(red: 0.1, green: 0.45, blue: 0.3), in: RoundedRectangle(cornerRadius: 18))
@@ -745,6 +834,13 @@ final class PlaceCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDe
                 } label: { primaryLabel("Bắt đầu", icon: "location.north.fill") }
                     .buttonStyle(.borderedProminent).tint(.green)
                     .disabled(navigation.preparing || navigation.plannedRoute == nil)
+                if navigation.canSimulate {
+                    Button {
+                        navigation.beginSimulation()
+                        if navigation.simulating { showingRoute = false }
+                    } label: { primaryLabel("Chạy thử trên HUD", icon: "play.circle") }
+                        .buttonStyle(.bordered)
+                }
             } else {
                 Button { bluetooth.connect() } label: { primaryLabel(bluetooth.connecting ? "Đang kết nối HUD…" : "Kết nối HUD để bắt đầu", icon: "display") }
                     .buttonStyle(.borderedProminent).disabled(bluetooth.connecting)
@@ -758,12 +854,22 @@ final class PlaceCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDe
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(navigation.destinationName).font(.headline).lineLimit(1)
-                Text(navigation.tripSummary.isEmpty ? navigation.status : navigation.tripSummary)
+                Text(navigation.simulating || navigation.tripSummary.isEmpty ? navigation.status : navigation.tripSummary)
                     .font(.subheadline).foregroundStyle(Color(.secondaryLabel)).lineLimit(1)
             }
             Spacer()
-            Button(role: .destructive) { confirmingStop = true } label: {
-                Text("Kết thúc").font(.headline).padding(.horizontal, 6).padding(.vertical, 4)
+            if navigation.simulating && !navigation.simulationFinished {
+                Picker("Tốc độ chạy thử", selection: $navigation.simulationRate) {
+                    Text("1×").tag(1)
+                    Text("2×").tag(2)
+                    Text("4×").tag(4)
+                }.pickerStyle(.menu)
+            }
+            Button(role: .destructive) {
+                if navigation.simulating { navigation.stop() }
+                else { confirmingStop = true }
+            } label: {
+                Text(navigation.simulating ? "Dừng thử" : "Kết thúc").font(.headline).padding(.horizontal, 6).padding(.vertical, 4)
             }.buttonStyle(.borderedProminent).tint(.red)
         }
     }

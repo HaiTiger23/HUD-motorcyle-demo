@@ -1,0 +1,1 @@
+export const FF='/private/tmp/claude-501/-Users-macbook-Project-HUD-motorcyle-demo/806c2322-bffa-4944-9577-3a3c2c3eaba1/scratchpad/venv/lib/python3.9/site-packages/imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1';
